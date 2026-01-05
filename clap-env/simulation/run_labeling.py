@@ -1,4 +1,3 @@
-import argparse
 import os
 
 import numpy as np
@@ -6,8 +5,8 @@ import pandas as pd
 
 from strategies import get_next_similiar, get_next_max_min, get_next_cluster
 
-PARQUET_PATH = "/home/lucaa/audio_data/unc/audioset/audioset_eval.parquet"
-TEXT_EMBEDDING_PATH = "/home/lucaa/audio_data/unc/clap-env/clap_text_embeddings.npz"
+PARQUET_PATH = "/home/lucaa/urban-noise-classification/audioset/audioset_eval.parquet"
+TEXT_EMBEDDING_PATH = "/home/lucaa/urban-noise-classification/clap-env/clap_text_embeddings.npz"
 
 def load_parquet(path=PARQUET_PATH):
     return pd.read_parquet(path)
@@ -42,8 +41,8 @@ def run_simulation(mode="similar", steps=100):
     df["clap_labels"] = None
     df["clap_score"] = 0.0
 
-    print("Picking random start point...")
-    first_pick = df.sample(1).index[0]
+    print("Picking start point...")
+    first_pick = df.index[2]
     first_embedding = df.at[first_pick, "embedding"]
     first_label, first_score = get_clap_label(first_embedding, text_embeddings, text_names)
     df.at[first_pick, "clap_labels"] = first_label
@@ -98,9 +97,4 @@ def run_simulation(mode="similar", steps=100):
     print(f"Saved {len(classified_df)} labeled items to {output_path}")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", choices=["similar", "diverse"], default="similar")
-    parser.add_argument("--steps", type=int, default=1000)
-    args = parser.parse_args()
-    
-    run_simulation(mode=args.mode, steps=args.steps)
+    run_simulation(mode="similar", steps=100)

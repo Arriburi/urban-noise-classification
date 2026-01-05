@@ -2,10 +2,20 @@ import glob
 import os
 
 import laion_clap
-import numpy as np
+import librosa
+import numpy as np 
 
-INPUT_DIR = "/home/lucaa/audio_data/unc/audioset/eval_set_flac"
-OUTPUT_NPZ = "clap_audio_embeddings.npz"
+
+# Compatibility workaround: np.random.integers was removed in newer NumPy versions 
+# Because of new environment setup added code: 
+if not hasattr(np.random, "integers"):
+    def integers(low, high=None, size=None, dtype=np.int64):
+        rng = np.random.default_rng()
+        return rng.integers(low, high, size=size, dtype=dtype)
+    np.random.integers = integers
+
+INPUT_DIR = "/home/lucaa/urban-noise-classification/audioset/eval_set_flac"
+OUTPUT_NPZ = "/home/lucaa/urban-noise-classification/clap-env/clap_audio_embeddings.npz"
 
 
 def find_audio_files(root: str) -> list[str]:
@@ -32,20 +42,33 @@ audio_files = find_audio_files(INPUT_DIR)
 
 print(f"Found {len(audio_files)} audio files to process")
 
-batch_size = 8
+batch_size = 100
 all_embeddings: list[np.ndarray] = []
 
+total_items = len(audio_files)
 for i in range(0, len(audio_files), batch_size):
     batch_files = audio_files[i : i + batch_size]
-    print(f"Processing batch {i//batch_size + 1}/{(len(audio_files)-1)//batch_size + 1}")
+    items_processed = min(i + batch_size, total_items)
+    
+    if items_processed % 100 == 0:
+        print(f"Processing batches {items_processed}/{total_items}")
 
     try:
-        batch_embeddings = model.get_audio_embedding_from_filelist(
-            x=batch_files, use_tensor=False
-        )
+        batch_embeddings = []
+        for file_path in batch_files:
+            audio_data, _ = librosa.load(file_path, sr=48000, mono=True)
+            audio_data = audio_data.reshape(1, -1)
+            audio_data = audio_data.astype(np.float32)
+            
+            embedding = model.get_audio_embedding_from_data(x=audio_data, use_tensor=False)
+            batch_embeddings.append(embedding)
+        
+        batch_embeddings = np.vstack(batch_embeddings)
         all_embeddings.append(batch_embeddings)
     except Exception as e:
         print(f"Error processing batch: {e}")
+        import traceback
+        traceback.print_exc()
         exit(1)
 
 audio_embed = np.vstack(all_embeddings)

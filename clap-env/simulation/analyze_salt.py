@@ -38,7 +38,7 @@ def analyze_salt_matches(input_path: str):
 
 
 def main():
-    input_path = "/home/lucaa/audio_data/unc/clap-env/simulation/salt_matches.parquet"
+    input_path = "/home/lucaa/urban-noise-classification/clap-env/simulation/salt_matches.parquet"
     stats = analyze_salt_matches(input_path)
     return stats
 

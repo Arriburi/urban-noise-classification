@@ -4,7 +4,7 @@ from joblib import Parallel, delayed
 
 import pandas as pd
 
-SYS_SALT_ROOT = "/home/lucaa/audio_data/unc/clap-env"
+SYS_SALT_ROOT = "/home/lucaa/urban-noise-classification/clap-env"
 if SYS_SALT_ROOT not in sys.path:
     sys.path.append(SYS_SALT_ROOT)
 
@@ -76,8 +76,8 @@ def add_salt_columns(input_path, output_path=None):
 
 
 def main():
-    INPUT_PATH = "/home/lucaa/audio_data/unc/clap-env/simulation/simulation_results_similar_5000.parquet"
-    OUTPUT_PATH = "/home/lucaa/audio_data/unc/clap-env/simulation/salt_matches.parquet"
+    INPUT_PATH = "/home/lucaa/urban-noise-classification/clap-env/simulation/simulation_results_similar_5000.parquet"
+    OUTPUT_PATH = "/home/lucaa/urban-noise-classification/clap-env/simulation/salt_matches.parquet"
 
     add_salt_columns(INPUT_PATH, OUTPUT_PATH)
 

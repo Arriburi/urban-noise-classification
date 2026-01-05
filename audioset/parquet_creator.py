@@ -4,11 +4,14 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-CSV_PATH = Path("/home/lucaa/audio_data/unc/audioset/eval_segments.csv")
-FLAC_DIR = Path("/home/lucaa/audio_data/unc/audioset/eval_set_flac")
-ONTOLOGY_PATH = Path("/home/lucaa/audio_data/unc/clap-env/ontology.json")
-AUDIO_EMBEDDINGS_PATH = Path("/home/lucaa/audio_data/unc/clap-env/clap_audio_embeddings.npz")
-OUTPUT_PATH = Path("/home/lucaa/audio_data/unc/audioset/audioset_eval.parquet")
+
+## to use after audio_embedding.py has been run
+
+CSV_PATH = Path("/home/lucaa/urban-noise-classification/audioset/eval_segments.csv")
+FLAC_DIR = Path("/home/lucaa/urban-noise-classification/audioset/eval_set_flac")
+ONTOLOGY_PATH = Path("/home/lucaa/urban-noise-classification/clap-env/ontology.json")
+AUDIO_EMBEDDINGS_PATH = Path("/home/lucaa/urban-noise-classification/clap-env/clap_audio_embeddings.npz")
+OUTPUT_PATH = Path("/home/lucaa/urban-noise-classification/audioset/audioset_eval.parquet")
 
 def load_ontology_mapping() -> dict[str, str]:
     with open(ONTOLOGY_PATH, "r") as f:

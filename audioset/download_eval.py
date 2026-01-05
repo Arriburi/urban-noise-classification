@@ -4,12 +4,11 @@ import soundfile as sf
 
 dataset = load_dataset(
     "agkphysics/AudioSet",
-    name="balanced",      
-    split="test",
-    streaming=True,     
+    name="balanced",
+    split="test",   # this IS the eval split
 )
 
-output_dir = Path("/home/lucaa/audio_data/unc/audioset/eval_set_flac")
+output_dir = Path("/home/lucaa/urban-noise-classification/audioset/eval_set_flac")
 output_dir.mkdir(parents=True, exist_ok=True)
 
 for i, sample in enumerate(dataset):
