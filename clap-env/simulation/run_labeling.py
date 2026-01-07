@@ -3,7 +3,7 @@ import os
 import numpy as np
 import pandas as pd
 
-from strategies import get_next_similiar, get_next_max_min, get_next_cluster
+from strategies import get_next_similiar, get_next_max_min, get_next_cluster, get_next_meand
 
 PARQUET_PATH = "/home/lucaa/urban-noise-classification/audioset/audioset_eval.parquet"
 TEXT_EMBEDDING_PATH = "/home/lucaa/urban-noise-classification/clap-env/clap_text_embeddings.npz"
@@ -33,7 +33,7 @@ def get_clap_label(audio_embedding, text_embeddings, class_names):
 
     return closest_label, best_score
 
-def run_simulation(mode="similar", steps=100):
+def run_simulation(steps, mode, window_size=None):
     df = load_parquet()
     text_names, text_embeddings = load_text_embeddings()
 
@@ -42,7 +42,8 @@ def run_simulation(mode="similar", steps=100):
     df["clap_score"] = 0.0
 
     print("Picking start point...")
-    first_pick = df.index[2]
+    first_pick = df.index[0]
+    embeddings_history = [df.at[first_pick, "embedding"].copy()]
     first_embedding = df.at[first_pick, "embedding"]
     first_label, first_score = get_clap_label(first_embedding, text_embeddings, text_names)
     df.at[first_pick, "clap_labels"] = first_label
@@ -63,6 +64,9 @@ def run_simulation(mode="similar", steps=100):
 
         elif mode == "diverse":
             next_embedding = get_next_max_min(df)
+        
+        elif mode == "mean":
+            next_embedding = get_next_meand(df, window_size, embeddings_history)
 
         else:
             print(f"Unknown mode: {mode}")
@@ -74,15 +78,21 @@ def run_simulation(mode="similar", steps=100):
 
         audio_embedding = df.at[next_embedding, "embedding"]
 
+        # Check similarity between consecutive picks
+        last_norm = last_embedding / (np.linalg.norm(last_embedding) + 1e-12)
+        audio_norm = audio_embedding / (np.linalg.norm(audio_embedding) + 1e-12)
+        embedding_similarity = np.dot(last_norm, audio_norm)
+
         label, score = get_clap_label(audio_embedding, text_embeddings, text_names)
 
         df.at[next_embedding, "clap_labels"] = label
         df.at[next_embedding, "clap_score"] = score
         df.at[next_embedding, "is_classified"] = True
+        embeddings_history.append(audio_embedding.copy())
 
         last_embedding = audio_embedding
 
-        print(f"Step {step}: Classified Index {next_embedding} as '{label}' ({score:.2f})")
+        print(f"Step {step}: Index {next_embedding}, Label: '{label}', Embedding sim: {embedding_similarity:.3f}, CLAP score: {score:.2f}")
             
     print("\nSimulation finished.")
 
@@ -91,10 +101,13 @@ def run_simulation(mode="similar", steps=100):
         ["video_id", "clap_labels", "human_labels"],
     ].reset_index(drop=True)
 
-    output_filename = f"simulation_results_{mode}_{steps}.parquet"
+    if mode == "mean":
+        output_filename = f"simulation_meand_n{window_size}_{steps}.parquet"
+    else:
+        output_filename = f"simulation_{mode}_{steps}.parquet"
     output_path = os.path.join(os.path.dirname(__file__), output_filename)
     classified_df.to_parquet(output_path, index=False)
     print(f"Saved {len(classified_df)} labeled items to {output_path}")
 
 if __name__ == "__main__":
-    run_simulation(mode="similar", steps=100)
+    run_simulation(steps=40, mode="diverse")
