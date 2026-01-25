@@ -2,7 +2,7 @@
 name = "urban-noise-classification"
 version = "0.1.0"
 description = "Thesis project regarding speeding up urban noise classification"
-authors = [{name = "lucaa"}]
+authors = [{name = "arriburi"}]
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
@@ -10,14 +10,17 @@ dependencies = [
     "ffmpeg>=1.4",
     "laion-clap @ git+https://github.com/LAION-AI/CLAP.git",
     "numpy>=1.26.0,<2.0.0",
-    "py-salt @ file:///home/lucaa/urban-noise-classification/py-salt-repo/py-salt",
+    "py-salt @ file:///home/arriburi/projects/py-salt-repo/py-salt",
     "pygraphviz>=1.14",
     "soundfile>=0.13.1",
-    "torch>=2.0.0,<2.6.0",
+    "torch>=2.4.0,<2.6.0",
     "torchcodec>=0.9.1",
     "torchvision>=0.15.0,<0.21.0",
-    "transformers>=4.35.0",
+    "transformers>=4.51.3",
 ]
 
 [project.optional-dependencies]
 dev = []
+
+[tool.setuptools]
+packages = []  # This is a data/script project, not a Python package

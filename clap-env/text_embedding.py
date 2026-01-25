@@ -1,4 +1,5 @@
 import json
+import os
 from typing import Iterable, List, Sequence, Tuple
 
 import laion_clap
@@ -24,7 +25,7 @@ def batched(seq: Sequence[str], batch_size: int) -> Iterable[Sequence[str]]:
 model = laion_clap.CLAP_Module(enable_fusion=False)
 model.load_ckpt()
 
-ontology_file = "/home/lucaa/urban-noise-classification/clap-env/ontology.json"
+ontology_file = os.path.join(os.path.dirname(__file__), "ontology.json")
 with open(ontology_file, "r") as f:
     ontology = json.load(f)
 
@@ -65,7 +66,7 @@ for batch in batched(list(text_prompts), BATCH_SIZE):
 text_embeddings = np.concatenate(embeddings, axis=0)
 names_array = np.asarray(names)
 
-embeddings_path = "/home/lucaa/urban-noise-classification/clap-env/clap_text_embeddings.npz"
+embeddings_path = os.path.join(os.path.dirname(__file__), "clap_text_embeddings.npz")
 np.savez(
     embeddings_path,
     names=names_array,

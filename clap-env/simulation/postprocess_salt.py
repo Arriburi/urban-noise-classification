@@ -4,7 +4,7 @@ from joblib import Parallel, delayed
 
 import pandas as pd
 
-SYS_SALT_ROOT = "/home/lucaa/urban-noise-classification/clap-env"
+SYS_SALT_ROOT = os.path.join(os.path.dirname(__file__), "..")
 if SYS_SALT_ROOT not in sys.path:
     sys.path.append(SYS_SALT_ROOT)
 
