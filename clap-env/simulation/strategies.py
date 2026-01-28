@@ -6,14 +6,30 @@ def normalize(v):
     return v / (norm + 1e-12)
 
 
-def get_next_similiar(embeddings_history, df):
+def sliding_window_mean(df, classified_indices, window_size):
+    if not classified_indices:
+        return None
+
+    recent_indices = classified_indices[-window_size:]
+    rows = df.loc[recent_indices]
+
+    if rows.empty:
+        return None
+
+    embeddings = np.stack(rows["embedding"].values)
+    mean_emb = np.mean(embeddings, axis=0)
+    return normalize(mean_emb)
+
+
+def get_next_similiar(df, classified_indices):
     unclassified_mask = df["is_classified"] == False
     unclassified_df = df[unclassified_mask]
 
     if unclassified_df.empty:
         return None
 
-    all_classified = np.stack(embeddings_history)
+    rows = df.loc[classified_indices]
+    all_classified = np.stack(rows["embedding"].values)
     mean_embedding = np.mean(all_classified, axis=0)
     mean_embedding = normalize(mean_embedding)
 
@@ -39,7 +55,7 @@ def get_next_max_min(df):
     classified_df = df[classified_mask]
 
     if classified_df.empty:
-        return unclassified_df.sample(1).index[0]
+        raise ValueError("No classified samples found for max-min selection")
 
     U = np.stack(unclassified_df["embedding"].values)
     C = np.stack(classified_df["embedding"].values)
@@ -60,54 +76,50 @@ def get_next_max_min(df):
     return unclassified_df.index[best_candidate_idx]
 
 
-def get_next_meand(df, window_size, embeddings_history):
+def get_next_meand(df, window_size, classified_indices):
     unclassified_mask = df["is_classified"] == False
     unclassified_df = df[unclassified_mask]
 
     if unclassified_df.empty:
         return None
 
-    # Extract sliding window: last window_size embeddings (or all if fewer than window_size)
-    window_embeddings = embeddings_history[-window_size:]
+    mean_embedding = sliding_window_mean(df, classified_indices, window_size)
+    if mean_embedding is None:
+        return None
 
-    # Stack window embeddings and compute mean
-    window_array = np.stack(window_embeddings)
-    mean_embedding = np.mean(window_array, axis=0)
-    mean_embedding = normalize(mean_embedding)
-
-    # Get all unclassified embeddings
     unclassified_embeddings = np.stack(unclassified_df["embedding"].values)
     unclassified_embeddings = normalize(unclassified_embeddings)
 
-    mean_embeddings = np.dot(unclassified_embeddings, mean_embedding)
-
-    best_candidate_idx = np.argmin(mean_embeddings)
+    similarities = np.dot(unclassified_embeddings, mean_embedding)
+    best_candidate_idx = np.argmin(similarities)
 
     return unclassified_df.index[best_candidate_idx]
 
 
-def get_next_cluster():
+def get_next_random(df):
+    unclassified = df[~df["is_classified"]]
+    if unclassified.empty:
+        return None
+    return unclassified.sample(1).index[0]
 
-    pass
 
-
-def get_next_groundtruth(df, class_counts):
+def get_next_groundtruth(df, class_counts, classified_indices, window_size):
     min_count = min(class_counts.values())
     min_classes = [cls for cls, count in class_counts.items() if count == min_count]
     min_class = np.random.choice(min_classes)
 
-    classified = df[df["is_classified"]]
-    target_indices = []
-    for idx in classified.index:
-        labels = classified.at[idx, "human_labels"]
-        if min_class in labels:
-            target_indices.append(idx)
+    filtered_indices = []
+    for idx in classified_indices:
+        human_labels = df.at[idx, "human_labels"]
+        if min_class in human_labels:
+            filtered_indices.append(idx)
 
-    target_class_recordings = classified.loc[target_indices]
+    mean_embedding = sliding_window_mean(df, filtered_indices, window_size)
 
-    target_embeddings = np.stack(target_class_recordings["embedding"].values)
-    mean_embedding = np.mean(target_embeddings, axis=0)
-    mean_embedding = normalize(mean_embedding)
+    if mean_embedding is None:
+        raise ValueError(
+            f"No history found for class '{min_class}' in classified_indices"
+        )
 
     unclassified = df[~df["is_classified"]]
     unclassified_embeddings = np.stack(unclassified["embedding"].values)
