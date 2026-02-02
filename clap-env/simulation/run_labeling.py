@@ -9,6 +9,7 @@ from strategies import (
     get_next_meand,
     get_next_groundtruth,
     get_next_random,
+    update_mean,
 )
 
 PARQUET_PATH = os.path.join(
@@ -58,14 +59,21 @@ def run_simulation(steps, mode, window_size=None, seed=None):
     print(f"Running mode: {mode}")
 
     df = load_parquet()
-    text_names, text_embeddings = load_text_embeddings()
+    # text_names, text_embeddings = load_text_embeddings()
+
+    # Pre-normalize all embeddings once (for cosine similarity)
+    all_embeddings = np.stack(df["embedding"].values)
+    norms = np.linalg.norm(all_embeddings, axis=1, keepdims=True)
+    all_embeddings_norm = all_embeddings / (norms + 1e-12)
+
+    # Boolean array for tracking classified status
+    n_samples = len(df)
+    is_classified = np.zeros(n_samples, dtype=bool)
 
     base_dataset_name = os.path.basename(PARQUET_PATH).replace(".parquet", "")
     short_name = base_dataset_name.replace("audioset_eval_", "")
 
-    df["is_classified"] = False
-    df["clap_labels"] = None
-    df["clap_score"] = 0.0
+    running_mean = None
 
     # THE MEAN EMBEDDING of all recordings first pick
     # all_embeddings = np.stack(df["embedding"].values)
@@ -77,17 +85,15 @@ def run_simulation(steps, mode, window_size=None, seed=None):
     # similarities = np.dot(all_embeddings, mean_embedding)
     # first_pick = df.index[np.argmax(similarities)]
 
-    # First pick only for modes that need it (similar, diverse, mean)
+    # First pick only for modes that need it (similar, diverse, mean). Use position (iloc) consistently.
     if mode in ("similar", "diverse", "mean"):
-        first_pick = df.sample(1).index[0]
+        first_pick_index = df.sample(1).index[0]
+        first_pick = df.index.get_loc(first_pick_index)
         classified_indices = [first_pick]
-        first_embedding = df.at[first_pick, "embedding"]
-        first_label, first_score = get_clap_label(
-            first_embedding, text_embeddings, text_names
-        )
-        df.at[first_pick, "clap_labels"] = first_label
-        df.at[first_pick, "clap_score"] = first_score
-        df.at[first_pick, "is_classified"] = True
+        first_embedding = all_embeddings[first_pick]
+        if mode in ("similar", "mean"):
+            running_mean = first_embedding.copy()
+        is_classified[first_pick] = True
     else:
         # groundtruth and random don't need first_pick
         classified_indices = []
@@ -107,32 +113,20 @@ def run_simulation(steps, mode, window_size=None, seed=None):
 
     if mode == "groundtruth":
         for class_name in class_names_list:
-            matching_indices = []
-            for idx in df.index:
-                if class_name in df.at[idx, "human_labels"]:
-                    matching_indices.append(idx)
-            available = df.loc[matching_indices]
-            available = available[~available["is_classified"]]
+            # Find samples with this class label that aren't classified yet. Store positions (iloc).
+            mask = df["human_labels"].apply(lambda x: class_name in x)
+            available = df[mask & ~pd.Series(is_classified, index=df.index)]
 
             if len(available) < seeds_per_class:
-                selected = available.index.tolist()
+                selected_index = available.index.tolist()
             else:
-                selected = available.sample(seeds_per_class).index.tolist()
+                selected_index = available.sample(seeds_per_class).index.tolist()
+            selected_pos = [df.index.get_loc(i) for i in selected_index]
 
-            for idx in selected:
-                audio_embedding = df.at[idx, "embedding"]
-                label, score = get_clap_label(
-                    audio_embedding, text_embeddings, text_names
-                )
-                df.at[idx, "clap_labels"] = label
-                df.at[idx, "clap_score"] = score
-                df.at[idx, "is_classified"] = True
-                classified_indices.append(idx)
+            for pos in selected_pos:
+                is_classified[pos] = True
+                classified_indices.append(pos)
                 class_counts[class_name] += 1
-
-        # DEBUG: update last_embedding after seeding
-        # last_embedding = df.at[classified_indices[-1], "embedding"]
-        # print(f"\nAfter seeding ({len(classified_indices)} total), class_counts: {class_counts}")
 
     if mode == "groundtruth":
         start_step = len(class_names_list) * seeds_per_class + 1
@@ -146,21 +140,29 @@ def run_simulation(steps, mode, window_size=None, seed=None):
         next_idx = None
 
         if mode == "similar":
-            next_idx = get_next_similiar(df, classified_indices)
+            next_idx = get_next_similiar(
+                all_embeddings_norm, is_classified, running_mean
+            )
 
         elif mode == "diverse":
-            next_idx = get_next_max_min(df)
+            next_idx = get_next_max_min(all_embeddings_norm, is_classified)
 
         elif mode == "mean":
-            next_idx = get_next_meand(df, window_size, classified_indices)
+            next_idx = get_next_meand(all_embeddings_norm, is_classified, running_mean)
 
         elif mode == "groundtruth":
             next_idx = get_next_groundtruth(
-                df, class_counts, classified_indices, window_size
+                all_embeddings,
+                all_embeddings_norm,
+                is_classified,
+                df,
+                class_counts,
+                classified_indices,
+                window_size,
             )
 
         elif mode == "random":
-            next_idx = get_next_random(df)
+            next_idx = get_next_random(df, is_classified)
 
         else:
             raise ValueError(f"Unknown mode: {mode}")
@@ -168,36 +170,33 @@ def run_simulation(steps, mode, window_size=None, seed=None):
         if next_idx is None:
             raise ValueError(f"Next pick is None at step {step}")
 
-        audio_embedding = df.at[next_idx, "embedding"]
+        audio_embedding = all_embeddings[next_idx]
 
-        # DEBUG: embedding similarity between consecutive picks
-        # last_norm = last_embedding / (np.linalg.norm(last_embedding) + 1e-12)
-        # audio_norm = audio_embedding / (np.linalg.norm(audio_embedding) + 1e-12)
-        # embedding_similarity = np.dot(last_norm, audio_norm)
-        # print(f"Step {step}: embedding_sim={embedding_similarity:.3f}")
-
-        label, score = get_clap_label(audio_embedding, text_embeddings, text_names)
-
-        df.at[next_idx, "clap_labels"] = label
-        df.at[next_idx, "clap_score"] = score
-        df.at[next_idx, "is_classified"] = True
+        is_classified[next_idx] = True
         classified_indices.append(next_idx)
 
-        # DEBUG: update for next iteration
-        # last_embedding = audio_embedding
+        if mode == "similar":
+            running_mean = update_mean(
+                running_mean, audio_embedding, len(classified_indices)
+            )
+        if mode == "mean":
+            if len(classified_indices) <= window_size:
+                oldest_embedding = None
+                total_count = len(classified_indices)
+            else:
+                oldest_idx = classified_indices[-(window_size + 1)]
+                oldest_embedding = all_embeddings[oldest_idx]
+                total_count = window_size
+            running_mean = update_mean(
+                running_mean, audio_embedding, total_count, oldest_embedding
+            )
 
         if mode == "groundtruth":
-            human_label = df.at[next_idx, "human_labels"][0]
+            human_label = df.iloc[next_idx]["human_labels"][0]
             class_counts[human_label] += 1
 
-        if step % 100 == 0 or step == steps:
-            print(f"Progress: {step}/{steps}")
-
-    print("Completed")
-
-    classified_df = df.loc[
-        df["is_classified"],
-        ["video_id", "clap_labels", "human_labels"],
+    classified_df = df.iloc[classified_indices][
+        ["video_id", "human_labels"]
     ].reset_index(drop=True)
 
     if mode in ("mean", "groundtruth"):
@@ -217,66 +216,62 @@ def run_simulation(steps, mode, window_size=None, seed=None):
 
 
 if __name__ == "__main__":
-    import shutil
     import time
+    from multiprocessing import Pool
 
     OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "outputs")
-    if os.path.exists(OUTPUT_DIR):
-        shutil.rmtree(OUTPUT_DIR)
-        print(f"Cleared {OUTPUT_DIR}")
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-    # TEST MODE
-    TEST_MODE = True
-
-    start_time = time.time()
+    TEST_MODE = False
 
     if TEST_MODE:
-        steps = 50
-        seeds = [1]
-        groundtruth_windows = [5]
-        mean_windows = [10]
+        steps = 200
+        seeds = [1, 2, 3]
+        groundtruth_windows = [3, 5]
+        mean_windows = [10, 50]
+        num_workers = 4
     else:
         steps = 7 * 225
         seeds = range(1, 31)
-        groundtruth_windows = [1, 3, 5, 10]
+        groundtruth_windows = [15, 20, 30, 40, 50]  #
         mean_windows = [10, 50, 100, 250, 500, 1000]
+        num_workers = 10  # got 12
 
+    tasks = []
     for seed in seeds:
-        run_simulation(steps=steps, mode="random", seed=seed)
+        # tasks.append((steps, "random", None, seed))
+        # tasks.append((steps, "similar", None, seed))
+        # tasks.append((steps, "diverse", None, seed))
+        for window in groundtruth_windows:
+            tasks.append((steps, "groundtruth", window, seed))
+        # for window in mean_windows:
+        #     tasks.append((steps, "mean", window, seed))
 
-    for window in groundtruth_windows:
-        for seed in seeds:
-            run_simulation(
-                steps=steps, mode="groundtruth", window_size=window, seed=seed
-            )
+    print(f"Running {len(tasks)} simulations with {num_workers} workers...")
 
-    for seed in seeds:
-        run_simulation(steps=steps, mode="similar", seed=seed)
+    def run_task(args):
+        steps, mode, window_size, seed = args
+        run_simulation(steps=steps, mode=mode, window_size=window_size, seed=seed)
 
-    for seed in seeds:
-        run_simulation(steps=steps, mode="diverse", seed=seed)
+    start_time = time.time()
+    total_tasks = len(tasks)
 
-    for window in mean_windows:
-        for seed in seeds:
-            run_simulation(steps=steps, mode="mean", window_size=window, seed=seed)
+    with Pool(processes=num_workers) as pool:
+        completed = 0
+        for _ in pool.imap(run_task, tasks):
+            completed += 1
+            progress = completed / total_tasks
+            bar_width = 40
+            filled = int(bar_width * progress)
+            bar = "#" * filled + "-" * (bar_width - filled)
+            print(f"\r[{bar}] {progress * 100:5.1f}% ({completed}/{total_tasks} simulations)", end="", flush=True)
+        print()  # Newline after progress bar
 
     elapsed = time.time() - start_time
 
     print("\n")
     print("  +++++++++++++++++++++++++++++++++++++++++++++")
-    print("  +                                           +")
-    print("  +  PROCESS COMPLETE. MACHINE SPIRIT STABLE. +")
-    print("  +  THE OMNISSIAH PROTECTS.                  +")
-    print("  +                                           +")
-    print("  +++++++++++++++++++++++++++++++++++++++++++++")
     print(f"  ++ OUTPUT :: {OUTPUT_DIR}")
-    print(f"  ++ FILES  :: {len(os.listdir(OUTPUT_DIR))}")
-    print(f"  ++ TIME   :: {elapsed:.1f} seconds")
-
-    if TEST_MODE:
-        # Estimate full run: 390 sims × 1575 steps vs 5 sims × 50 steps
-        full_estimate = elapsed * (390 / 5) * (1575 / 50)
-        hours = full_estimate / 3600
-        print(f"  ++ FULL RUN ESTIMATE :: {hours:.1f} hours")
-
+    print(f"  ++ FILES  :: {len(tasks)}")
+    print(f"  ++ TIME   :: {elapsed:.1f} seconds ({elapsed/60:.1f} minutes)")
     print("  ++ END TRANSMISSION ++\n")
