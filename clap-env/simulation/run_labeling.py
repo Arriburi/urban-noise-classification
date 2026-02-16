@@ -3,6 +3,8 @@ import os
 import numpy as np
 import pandas as pd
 
+from collections import Counter
+
 from strategies import (
     get_next_similiar,
     get_next_max_min,
@@ -11,6 +13,53 @@ from strategies import (
     get_next_random,
     update_mean,
 )
+
+
+def analyze_groundtruth_hits(hit_log):
+    targets = sorted(set(t for t, _ in hit_log))
+    rows = []
+
+    total_hits = 0
+    total_all = 0
+
+    for cls in targets:
+        entries = [(t, a) for t, a in hit_log if t == cls]
+        hits = sum(1 for t, a in entries if t == a)
+        misses = len(entries) - hits
+        total = len(entries)
+        hit_rate = hits / total if total > 0 else 0.0
+
+        total_hits += hits
+        total_all += total
+
+        miss_classes = Counter(a for t, a in entries if t != a)
+        miss_detail = "; ".join(f"{c}: {n}" for c, n in miss_classes.most_common())
+
+        rows.append(
+            {
+                "target_class": cls,
+                "hits": hits,
+                "misses": misses,
+                "total": total,
+                "hit_rate": round(hit_rate, 4),
+                "miss_detail": miss_detail if miss_detail else "-",
+            }
+        )
+
+    overall_rate = total_hits / total_all if total_all > 0 else 0.0
+    rows.append(
+        {
+            "target_class": "OVERALL",
+            "hits": total_hits,
+            "misses": total_all - total_hits,
+            "total": total_all,
+            "hit_rate": round(overall_rate, 4),
+            "miss_detail": "-",
+        }
+    )
+
+    return rows
+
 
 PARQUET_PATH = os.path.join(
     os.path.dirname(__file__), "audioset_eval_top_mixed_no_mixed.parquet"
@@ -128,6 +177,9 @@ def run_simulation(steps, mode, window_size=None, seed=None):
                 classified_indices.append(pos)
                 class_counts[class_name] += 1
 
+    # Track hit/miss for groundtruth mode
+    hit_log = []
+
     if mode == "groundtruth":
         start_step = len(class_names_list) * seeds_per_class + 1
     elif mode in ("similar", "diverse", "mean"):
@@ -151,7 +203,7 @@ def run_simulation(steps, mode, window_size=None, seed=None):
             next_idx = get_next_meand(all_embeddings_norm, is_classified, running_mean)
 
         elif mode == "groundtruth":
-            next_idx = get_next_groundtruth(
+            next_idx, target_class = get_next_groundtruth(
                 all_embeddings,
                 all_embeddings_norm,
                 is_classified,
@@ -194,6 +246,21 @@ def run_simulation(steps, mode, window_size=None, seed=None):
         if mode == "groundtruth":
             human_label = df.iloc[next_idx]["human_labels"][0]
             class_counts[human_label] += 1
+            hit_log.append((target_class, human_label))
+
+    # --- Groundtruth hit/miss analysis ---
+    if mode == "groundtruth" and hit_log:
+        hit_summary = analyze_groundtruth_hits(hit_log)
+        hit_df = pd.DataFrame(hit_summary)
+
+        hit_filename = f"{short_name}_{mode}_n{window_size}_hits_{steps}_seed{seed}.csv"
+        HIT_DIR = os.path.join(os.path.dirname(__file__), "hit_results")
+        os.makedirs(HIT_DIR, exist_ok=True)
+        hit_path = os.path.join(HIT_DIR, hit_filename)
+        hit_df.to_csv(hit_path, index=False)
+        print(f"\nHit/miss analysis saved to {hit_path}")
+        print(hit_df.to_string(index=False))
+        print()
 
     classified_df = df.iloc[classified_indices][
         ["video_id", "human_labels"]
@@ -233,7 +300,7 @@ if __name__ == "__main__":
     else:
         steps = 7 * 225
         seeds = range(1, 31)
-        groundtruth_windows = [15, 20, 30, 40, 50]  #
+        groundtruth_windows = [15]  # Windows go from 1 to 50 with 10/15 interval
         mean_windows = [10, 50, 100, 250, 500, 1000]
         num_workers = 10  # got 12
 
@@ -264,7 +331,11 @@ if __name__ == "__main__":
             bar_width = 40
             filled = int(bar_width * progress)
             bar = "#" * filled + "-" * (bar_width - filled)
-            print(f"\r[{bar}] {progress * 100:5.1f}% ({completed}/{total_tasks} simulations)", end="", flush=True)
+            print(
+                f"\r[{bar}] {progress * 100:5.1f}% ({completed}/{total_tasks} simulations)",
+                end="",
+                flush=True,
+            )
         print()  # Newline after progress bar
 
     elapsed = time.time() - start_time

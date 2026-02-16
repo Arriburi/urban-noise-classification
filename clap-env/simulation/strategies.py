@@ -107,4 +107,4 @@ def get_next_groundtruth(
     similarities = all_embeddings_norm @ mean_embedding
     similarities[is_classified] = -np.inf
 
-    return np.argmax(similarities)
+    return np.argmax(similarities), min_class
