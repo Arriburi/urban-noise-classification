@@ -30,7 +30,7 @@ with open(ontology_file, "r") as f:
     ontology = json.load(f)
 
 # Filter out abastract and blacklist
-restrictions_to_exclude = {"abstract", "blacklist"}
+restrictions_to_exclude = {"abstract"}
 filtered_entries = [
     entry
     for entry in ontology

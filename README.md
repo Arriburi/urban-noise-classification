@@ -4,31 +4,46 @@
 
 1. **Download eval audio files**
    ```bash
-   uv run audioset/download_eval.py
+   python audioset/download_eval.py
    ```
-   → Outputs FLAC files to `eval_set_flac/`
+   → Outputs FLAC files to `audioset/eval_set_flac/`
 
-2. **Generate CLAP audio and text embeddings**
+2. **Generate CLAP audio embeddings (required)**
    ```bash
-   uv run clap-env/audio_embedding.py
-   uv run clap-env/text_embedding.py
+   python clap-env/audio_embedding.py
    ```
-   → Outputs `clap_audio_embeddings.npz`
+   → Outputs `clap-env/clap_audio_embeddings.npz`
 
-3. **Create parquet dataset -> combine embeddings and recording paths + video ids**
+3. **(Optional) Generate CLAP text embeddings**
    ```bash
-   uv run audioset/parquet_creator.py
+   python clap-env/text_embedding.py
    ```
-   → Outputs `audioset_eval.parquet`
+   → Outputs `clap-env/clap_text_embeddings.npz` (only needed for experiments using text–audio similarity)
 
-4. **Create simulation results in various mode strategies**
+4. **Create base parquet dataset (combine embeddings, paths, video IDs, labels)**
+   - Requires: `audioset/eval_segments.csv` from the official AudioSet eval metadata.
    ```bash
-   uv run simulation/run_labeling.py
+   python audioset/parquet_creator.py
    ```
-   → Outputs `simulation_results_{mode}_{steps}.parquet`
+   → Outputs `audioset/audioset_eval.parquet`
 
-5. **Compare clap and audioset labels for matches**
+5. **Transform labels to SALT mid-layer (for simulations)**
    ```bash
-   uv run simulation/postprocess_salt.py
+   python clap-env/simulation/transform_audioset.py
    ```
-   → Outputs `salt_matches.parquet`
+   → Reads `audioset/audioset_eval.parquet`, writes `clap-env/simulation/audioset_eval_mid.parquet`
+
+6. **Run active-learning simulations (all strategies / seeds)**
+   ```bash
+   python clap-env/simulation/run_labeling.py
+   ```
+   → Outputs per-seed simulation results under `clap-env/simulation/outputs/`
+
+7. **Analyze distributions (entropy, coverage, imbalance, shift)**
+   ```bash
+   python clap-env/simulation/check_distribution.py
+   ```
+
+8. **(Optional) Analyze groundtruth hits and SALT-based matches**
+   ```bash
+   python clap-env/simulation/analyze_hits.py

@@ -1,211 +1,229 @@
 #!/usr/bin/env python3
-import sys
 import os
+import sys
+
 import pandas as pd
-import numpy as np
 
-SYS_SALT_ROOT = os.path.join(os.path.dirname(__file__), "..")
-if SYS_SALT_ROOT not in sys.path:
-    sys.path.append(SYS_SALT_ROOT)
+# Use the local py-salt repo under clap-env/salt/py-salt
+SALT_REPO = os.path.join(os.path.dirname(__file__), "..", "salt", "py-salt")
+if SALT_REPO not in sys.path:
+    sys.path.append(SALT_REPO)
 
-from salt import compare_labels
 from py_salt import event_mapping
 
 e = event_mapping.EventExplorer()
 
-# Original parquet file - DO NOT MODIFY
-ORIGINAL_PARQUET = "/home/lucaa/urban-noise-classification/audioset/audioset_eval.parquet"
+# Use the audioset_eval.parquet created by audioset/parquet_creator.py
+ORIGINAL_PARQUET = (
+    "/home/arriburi/projects/urban-noise-classification/audioset/audioset_eval.parquet"
+)
+SIMULATION_DIR = os.path.dirname(__file__)
 
 
-def create_top_parents_file():
-    df = pd.read_parquet(ORIGINAL_PARQUET)
-    
-    def get_top_parent(label):
-        try:
-            std_label = e.get_std_label_from_dataset_label(label.strip())
-            paths = e.get_paths_to_label(std_label)
-            if paths and len(paths[0]) > 0:
-                top = paths[0][0]
-                # Special case: map "water" to "natural_sounds" since water sounds are natural
-                if top == 'water':
-                    return 'natural_sounds'
-                # Return the top parent for all other labels
-                return top
-        except:
-            pass
-        return None
-    
-    def transform_labels(human_labels):
-        # Handle numpy arrays, lists, or single values
-        if human_labels is None or (isinstance(human_labels, float) and pd.isna(human_labels)):
-            return []
-        
-        # Convert to list if it's a numpy array or other iterable
-        if not isinstance(human_labels, list):
-            try:
-                human_labels = list(human_labels)
-            except:
-                human_labels = [human_labels]
-        
-        # Transform each label to its top parent
-        top_parents = [get_top_parent(str(label)) for label in human_labels]
-        return [p for p in top_parents if p is not None]
-    
-    df['human_labels'] = df['human_labels'].apply(transform_labels)
-    
-    output_path = os.path.join(os.path.dirname(__file__), "audioset_eval_top.parquet")
-    df.to_parquet(output_path, index=False)
+def to_list(value):
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return []
+    if isinstance(value, list):
+        return value
+    try:
+        return list(value)
+    except TypeError:
+        return [value]
 
 
-def create_mixed_and_non_mixed_files():
-    input_path = os.path.join(os.path.dirname(__file__), "audioset_eval_top.parquet")
-    df = pd.read_parquet(input_path)
-    
-    salt_to_audioset = {
-        'human_sounds': 'Human sounds',
-        'animal': 'Animal',
-        'music': 'Music',
-        'natural_sounds': 'Natural sounds',
-        'source-ambiguous_sounds': 'Source-ambiguous sounds',
-        'channel_environment_and_background': 'Channel, environment and background',
-        'sound_of_things': 'Sounds of things'
-    }
-    
-    def process_labels_mixed(human_labels):
-        if human_labels is None:
-            return []
-        if not isinstance(human_labels, list):
-            try:
-                human_labels = list(human_labels)
-            except:
-                human_labels = [human_labels]
-        
-        unique_labels = list(set(human_labels))
-        if len(unique_labels) > 1:
-            result = ['Mixed']
+# Simple in-process cache so we only resolve each distinct label once.
+_PATH_CACHE = {}
+
+# SALT top-layer labels for this taxonomy (depth 1 roots).
+TOP_LEVEL_LABELS = {
+    "human_sounds",
+    "animal",
+    "music",
+    "natural_sounds",
+    "source-ambiguous_sounds",
+    "channel_environment_and_background",
+    "sound_of_things",
+    "water",
+    "human_activities",
+    "other",
+}
+
+
+def get_all_paths(label):
+    """Get ALL SALT ontology paths for a label.
+
+    Returns list of paths (each a list of labels) or None when the
+    label cannot be mapped into the SALT taxonomy.
+    """
+    key = str(label).strip()
+    if key in _PATH_CACHE:
+        return _PATH_CACHE[key]
+
+    try:
+        std = e.get_std_label_from_dataset_label(key)
+        paths = e.get_paths_to_label(std)
+    except Exception:
+        paths = None
+    if not paths:
+        paths = None
+
+    _PATH_CACHE[key] = paths
+    return paths
+
+
+def extract_mid_layer_from_paths(paths):
+    """Extract mid-layer labels from all paths.
+
+    Mid-layer is depth 2 (path[1] if path length > 1, else path[0]).
+    Returns set of unique mid-layer labels.
+    """
+    if paths is None:
+        return set()
+
+    mid_layers = set()
+    for path in paths:
+        if not path:
+            continue
+        if len(path) == 1:
+            # Top-level only label
+            mid_layers.add(path[0])
         else:
-            result = unique_labels
-        
-        return [salt_to_audioset.get(label, label) for label in result]
-    
-    def process_labels_non_mixed(human_labels):
-        if human_labels is None:
-            return []
-        if not isinstance(human_labels, list):
-            try:
-                human_labels = list(human_labels)
-            except:
-                human_labels = [human_labels]
-        
-        unique_labels = list(set(human_labels))
-        return [salt_to_audioset.get(label, label) for label in unique_labels]
-    
-    # Create mixed version
-    df_mixed = df.copy()
-    df_mixed['human_labels'] = df_mixed['human_labels'].apply(process_labels_mixed)
-    output_path_mixed = os.path.join(os.path.dirname(__file__), "audioset_eval_top_mixed.parquet")
-    df_mixed.to_parquet(output_path_mixed, index=False)
-    
-    # Create non-mixed version
-    df_non_mixed = df.copy()
-    df_non_mixed['human_labels'] = df_non_mixed['human_labels'].apply(process_labels_non_mixed)
-    output_path_non_mixed = os.path.join(os.path.dirname(__file__), "audioset_eval_top_non_mixed.parquet")
-    df_non_mixed.to_parquet(output_path_non_mixed, index=False)
+            # Mid-layer is at index 1 (depth 2)
+            mid_layers.add(path[1])
+
+    return mid_layers
 
 
-def remove_redundant_parents():
-    df = pd.read_parquet(ORIGINAL_PARQUET)
-    
-    def get_label_path(label):
-        try:
-            std_label = e.get_std_label_from_dataset_label(str(label).strip())
-            paths = e.get_paths_to_label(std_label)
-            if paths and len(paths[0]) > 0:
-                return paths[0]  # Return the path as a list
-        except:
-            pass
+def coarsen_to_mid_layer(label):
+    """Map a label to its mid-layer parent(s), handling multiple paths.
+
+    Returns set of mid-layer labels (or None if label can't be mapped).
+    For labels with multiple paths, returns ALL mid-layer parents.
+    """
+    paths = get_all_paths(label)
+    if paths is None:
         return None
-    
-    def remove_parents(human_labels):
-        if human_labels is None or (isinstance(human_labels, float) and pd.isna(human_labels)):
-            return []
-        
-        # Convert to list if needed
-        if not isinstance(human_labels, list):
-            try:
-                human_labels = list(human_labels)
-            except:
-                human_labels = [human_labels]
-        
-        if len(human_labels) == 0:
-            return []
-        
-        # Get paths for all labels
-        label_paths = {}
-        for label in human_labels:
-            path = get_label_path(label)
-            if path:
-                label_paths[label] = path
-        
-        # Find labels to keep (those with no children in the list)
-        labels_to_keep = []
-        for label, path in label_paths.items():
-            is_parent = False
-            # Check if any other label's path starts with this label's path (is a descendant)
-            for other_label, other_path in label_paths.items():
-                if label != other_label and len(other_path) > len(path):
-                    # Check if other_path starts with path
-                    if other_path[:len(path)] == path:
-                        is_parent = True
-                        break
-            
-            if not is_parent:
-                labels_to_keep.append(label)
-        
-        return labels_to_keep if labels_to_keep else human_labels
-    
-    df['human_labels'] = df['human_labels'].apply(remove_parents)
-    
-    output_path = os.path.join(os.path.dirname(__file__), "audioset_eval_no_redundant_parents.parquet")
+    return extract_mid_layer_from_paths(paths)
+
+
+def prune_redundant_top_layers(labels):
+    """Given a list of (already mid-layer) SALT labels, drop any top-layer
+    label that has a more specific descendant also present in the list.
+
+    Example:
+        ['domestic_animal', 'onomatopoeia', 'animal']
+        -> ['domestic_animal', 'onomatopoeia']   # drop 'animal'
+
+    Assumes labels have already been coarsened to mid-layer / top-layer.
+    """
+    if not labels:
+        return labels
+
+    labels = list(labels)
+    top_labels = [label for label in labels if label in TOP_LEVEL_LABELS]
+    if not top_labels:
+        return labels
+
+    # Pre-fetch paths for all labels once (using cached get_all_paths).
+    paths_by_label = {label: get_all_paths(label) for label in labels}
+
+    to_drop = set()
+    for top in top_labels:
+        top_paths = paths_by_label.get(top)
+        # If we can't resolve the top label in SALT, be conservative and keep it.
+        if not top_paths:
+            continue
+
+        # A proper descendant must have a path that starts with the top label
+        # and is longer than length 1.
+        is_redundant = False
+        for other, other_paths in paths_by_label.items():
+            if other == top or not other_paths:
+                continue
+
+            for op in other_paths:
+                if not op or len(op) <= 1:
+                    continue
+                # SALT paths are root -> leaf, so top is an ancestor if it is
+                # the first element and there is at least one more level.
+                if op[0] == top:
+                    is_redundant = True
+                    break
+            if is_redundant:
+                break
+
+        if is_redundant:
+            to_drop.add(top)
+
+    if not to_drop:
+        return labels
+
+    return [label for label in labels if label not in to_drop]
+
+
+def create_mid_parents_file():
+    """Create parquet file with labels mapped to mid-layer (depth 2).
+
+    For each recording:
+    1. Map all labels to their mid-layer parents (handling multiple paths)
+    2. Keep top-level labels that have no deeper node
+    3. Deduplicate labels
+    """
+    df = pd.read_parquet(ORIGINAL_PARQUET)
+
+    unmapped_labels = set()
+
+    def transform_labels(label_list):
+        nonlocal unmapped_labels
+
+        labels = to_list(label_list)
+
+        # Collect all mid-layer labels from all paths
+        mid_layer_set = set()
+        for label in labels:
+            paths = get_all_paths(label)
+            if not paths:
+                unmapped_labels.add(str(label))
+                continue
+
+            for path in paths:
+                if not path:
+                    continue
+                if len(path) == 1:
+                    mid_layer_set.add(path[0])
+                else:
+                    mid_layer_set.add(path[1])
+
+        pruned = prune_redundant_top_layers(mid_layer_set)
+        return list(pruned)
+
+    df["human_labels"] = df["human_labels"].apply(transform_labels)
+
+    if unmapped_labels:
+        raise RuntimeError(
+            "Failed to map the following labels into SALT mid-layer: "
+            + ", ".join(sorted(unmapped_labels))
+        )
+
+    output_path = os.path.join(SIMULATION_DIR, "audioset_eval_mid.parquet")
     df.to_parquet(output_path, index=False)
 
+    # Print statistics
+    all_labels = set()
+    for labels in df["human_labels"]:
+        all_labels.update(labels)
+    print(f"Transformed to {len(all_labels)} unique mid-layer classes")
+    print("Top 10 classes by count:")
+    from collections import Counter
 
-def remove_mixed_rows():
-    input_path = os.path.join(os.path.dirname(__file__), "audioset_eval_top_mixed.parquet")
-    df = pd.read_parquet(input_path)
-    
-    def has_mixed(human_labels):
-        if human_labels is None:
-            return False
-        if isinstance(human_labels, (list, np.ndarray)):
-            return "Mixed" in human_labels
-        return human_labels == "Mixed"
-    
-    # Filter out rows with "Mixed"
-    df_filtered = df[~df['human_labels'].apply(has_mixed)]
-    
-    # Count all labels in filtered dataset
-    all_labels = []
-    for labels in df_filtered['human_labels']:
-        if isinstance(labels, (list, np.ndarray)) and len(labels) > 0:
-            all_labels.extend(labels)
-        elif labels is not None and not (isinstance(labels, float) and pd.isna(labels)):
-            all_labels.append(labels)
-    
-    label_counts = pd.Series(all_labels).value_counts()
-    total_labels = len(all_labels)
-    
-    output_path = os.path.join(os.path.dirname(__file__), "audioset_eval_top_mixed_no_mixed.parquet")
-    df_filtered.to_parquet(output_path, index=False)
-    
-    print(f"Removed {len(df) - len(df_filtered)} rows with 'Mixed'. Saved {len(df_filtered)} rows to {output_path}")
-    print(f"\nLabel distribution (Total labels: {total_labels}):")
-    print(f"{'Label':<50} {'Count':<15} {'Percentage':<10}")
-    print("-" * 75)
-    for label, count in label_counts.items():
-        pct = (count / total_labels) * 100 if total_labels > 0 else 0.0
-        print(f"{label:<50} {count:<15} {pct:>6.2f}%")
+    counts = Counter()
+    for labels in df["human_labels"]:
+        for label in labels:
+            counts[label] += 1
+    for label, count in counts.most_common(10):
+        print(f"  {label}: {count}")
 
 
 if __name__ == "__main__":
-    remove_mixed_rows()
+    # Always run the mid-layer transformation when executed as a script.
+    create_mid_parents_file()

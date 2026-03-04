@@ -7,11 +7,22 @@ import pandas as pd
 
 ## to use after audio_embedding.py has been run
 
-CSV_PATH = Path("/home/lucaa/urban-noise-classification/audioset/eval_segments.csv")
-FLAC_DIR = Path("/home/lucaa/urban-noise-classification/audioset/eval_set_flac")
-ONTOLOGY_PATH = Path("/home/lucaa/urban-noise-classification/clap-env/ontology.json")
-AUDIO_EMBEDDINGS_PATH = Path("/home/lucaa/urban-noise-classification/clap-env/clap_audio_embeddings.npz")
-OUTPUT_PATH = Path("/home/lucaa/urban-noise-classification/audioset/audioset_eval.parquet")
+CSV_PATH = Path(
+    "/home/arriburi/projects/urban-noise-classification/audioset/eval_segments.csv"
+)
+FLAC_DIR = Path(
+    "/home/arriburi/projects/urban-noise-classification/audioset/eval_set_flac"
+)
+ONTOLOGY_PATH = Path(
+    "/home/arriburi/projects/urban-noise-classification/clap-env/ontology.json"
+)
+AUDIO_EMBEDDINGS_PATH = Path(
+    "/home/arriburi/projects/urban-noise-classification/clap-env/clap_audio_embeddings.npz"
+)
+OUTPUT_PATH = Path(
+    "/home/arriburi/projects/urban-noise-classification/audioset/audioset_eval.parquet"
+)
+
 
 def load_ontology_mapping() -> dict[str, str]:
     with open(ONTOLOGY_PATH, "r") as f:
@@ -88,4 +99,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

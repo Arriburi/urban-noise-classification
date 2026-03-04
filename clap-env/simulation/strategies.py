@@ -1,4 +1,6 @@
 import numpy as np
+import pandas as pd
+from scipy.stats import beta as _beta_dist  # type: ignore[attr-defined]
 
 
 def normalize(v):
@@ -14,8 +16,6 @@ def sliding_window_mean(all_embeddings, classified_indices, window_size):
     embeddings = all_embeddings[recent_indices]
     mean_emb = np.mean(embeddings, axis=0)
     return normalize(mean_emb)
-
-    # welford
 
 
 def update_mean(mean_embedding, new_embedding, total_count, oldest_embedding=None):
@@ -36,6 +36,35 @@ def get_next_similiar(all_embeddings_norm, is_classified, running_mean):
     return np.argmax(similarities)
 
 
+def should_drop_label_bayesian(
+    hits: int,
+    attempts: int,
+    min_useful_hit_rate: float = 0.05,
+    confidence: float = 0.95,
+) -> bool:
+    """
+    Decide whether to drop a label based on its hit/attempt history.
+
+    - min_useful_hit_rate: lowest hit rate you still care about (e.g. 0.05 = 5%)
+    - confidence: how sure you want to be that the true hit rate is below that
+                  before dropping (e.g. 0.95 = 95%)
+
+    Returns True if the label looks bad enough to stop targeting.
+    """
+    if attempts <= 0:
+        return False  # no evidence, never drop
+
+    # Prior: Beta(1, 1) = uniform, weak and agnostic
+    alpha = 1.0 + hits
+    beta_param = 1.0 + (attempts - hits)
+
+    # Upper credible bound u such that P(p <= u | data) = confidence
+    upper_bound = float(_beta_dist.ppf(confidence, alpha, beta_param))
+
+    # Drop if even the upper plausible hit rate is below what we consider useful
+    return upper_bound < min_useful_hit_rate
+
+
 def get_next_max_min(all_embeddings_norm, is_classified):
     if np.all(is_classified):
         return None
@@ -45,16 +74,9 @@ def get_next_max_min(all_embeddings_norm, is_classified):
 
     C = all_embeddings_norm[is_classified]
 
-    # Compute similarities for ALL samples against classified
     similarities_matrix = all_embeddings_norm @ C.T
-
-    # Find max similarity to any classified sample (nearest neighbor)
     max_sims = np.max(similarities_matrix, axis=1)
-
-    # Mask out already classified
     max_sims[is_classified] = np.inf
-
-    # Find sample with lowest max similarity (furthest from any neighbor)
     return np.argmin(max_sims)
 
 
@@ -64,13 +86,12 @@ def get_next_meand(all_embeddings_norm, is_classified, running_mean):
 
     mean_embedding = normalize(running_mean)
     similarities = all_embeddings_norm @ mean_embedding
-    similarities[is_classified] = np.inf  # Use +inf for argmin
+    similarities[is_classified] = np.inf
 
     return np.argmin(similarities)
 
 
 def get_next_random(df, is_classified):
-    # Use df.sample() to maintain random state compatibility. Return position (iloc) for consistency.
     unclassified = df[~is_classified]
     if unclassified.empty:
         return None
@@ -86,9 +107,22 @@ def get_next_groundtruth(
     class_counts,
     classified_indices,
     window_size,
+    dropped_classes=None,
 ):
-    min_count = min(class_counts.values())
-    min_classes = [cls for cls, count in class_counts.items() if count == min_count]
+    if dropped_classes is None:
+        dropped_classes = set()
+
+    # Choose among classes that have NOT been dropped
+    active_items = [
+        (cls, count) for cls, count in class_counts.items() if cls not in dropped_classes
+    ]
+    if not active_items:
+        # All known classes have been dropped; fall back to using all classes
+        active_items = list(class_counts.items())
+
+    counts_only = [count for _, count in active_items]
+    min_count = min(counts_only)
+    min_classes = [cls for cls, count in active_items if count == min_count]
     min_class = np.random.choice(min_classes)
 
     filtered_indices = []
@@ -101,10 +135,256 @@ def get_next_groundtruth(
 
     if mean_embedding is None:
         raise ValueError(
-            f"No history found for class '{min_class}' in classified_indices"
+            f"No classified recordings found for class '{min_class}'. "
+            f"Diverse cold-start phase should have discovered this class."
         )
 
     similarities = all_embeddings_norm @ mean_embedding
     similarities[is_classified] = -np.inf
 
     return np.argmax(similarities), min_class
+
+
+def count_labels(human_labels, known_labels, class_counts):
+    for label in human_labels:
+        if label not in known_labels:
+            known_labels.add(label)
+            class_counts[label] = 0
+        class_counts[label] += 1
+
+
+def run_random_mode(df, all_embeddings_norm, steps, seed):
+    n_samples = len(df)
+    is_classified = np.zeros(n_samples, dtype=bool)
+    known_labels = set()
+    class_counts = {}
+    classified_indices = []
+
+    for step in range(1, steps + 1):
+        next_idx = get_next_random(df, is_classified)
+        if next_idx is None:
+            raise ValueError(f"Random returned None at step {step}")
+
+        is_classified[next_idx] = True
+        classified_indices.append(next_idx)
+
+        human_labels = df.iloc[next_idx]["human_labels"]
+        count_labels(human_labels, known_labels, class_counts)
+
+    return classified_indices, known_labels, class_counts
+
+
+def run_diverse_mode(df, all_embeddings_norm, steps, seed):
+    n_samples = len(df)
+    is_classified = np.zeros(n_samples, dtype=bool)
+    known_labels = set()
+    class_counts = {}
+    classified_indices = []
+
+    first_pick_index = df.sample(1).index[0]
+    first_pick = df.index.get_loc(first_pick_index)
+    is_classified[first_pick] = True
+    classified_indices.append(first_pick)
+
+    human_labels = df.iloc[first_pick]["human_labels"]
+    count_labels(human_labels, known_labels, class_counts)
+
+    for step in range(2, steps + 1):
+        next_idx = get_next_max_min(all_embeddings_norm, is_classified)
+        if next_idx is None:
+            raise ValueError(f"Diverse returned None at step {step}")
+
+        is_classified[next_idx] = True
+        classified_indices.append(next_idx)
+
+        human_labels = df.iloc[next_idx]["human_labels"]
+        count_labels(human_labels, known_labels, class_counts)
+
+    return classified_indices, known_labels, class_counts
+
+
+def run_groundtruth_mode(
+    df,
+    all_embeddings,
+    all_embeddings_norm,
+    steps,
+    seed,
+    window_size,
+    initial_classified_indices=None,
+    initial_known_labels=None,
+    initial_class_counts=None,
+):
+    """
+    Groundtruth-guided selection over the actual label space
+    (no coarse top-layer grouping).
+
+    Optional initial state (e.g. from diverse phase) for hybrid runs:
+    - initial_classified_indices: list of row indices already classified
+    - initial_known_labels: set of labels discovered so far
+    - initial_class_counts: dict label -> count
+    """
+    n_samples = len(df)
+    is_classified = np.zeros(n_samples, dtype=bool)
+    known_labels = set()
+    class_counts = {}
+    classified_indices = []
+    hit_log = []
+
+    # Groundtruth Bayesian drop-threshold configuration
+    GROUNDTRUTH_MIN_USEFUL_HIT_RATE = 0.05
+    GROUNDTRUTH_DROP_CONFIDENCE = 0.95
+
+    # Per-class tracking for the drop rule
+    attempts_per_class = {}
+    hits_per_class = {}
+    dropped_classes = set()
+
+    if (
+        initial_classified_indices is not None
+        and initial_known_labels is not None
+        and initial_class_counts is not None
+    ):
+        # Start from provided state (e.g. diverse phase output)
+        classified_indices = list(initial_classified_indices)
+        known_labels = set(initial_known_labels)
+        class_counts = dict(initial_class_counts)
+        for idx in classified_indices:
+            is_classified[idx] = True
+        num_groundtruth_steps = steps
+    else:
+        # Warm start: pick one random recording and learn its labels
+        first_pick_index = df.sample(1, random_state=seed).index[0]
+        first_pick = df.index.get_loc(first_pick_index)
+        is_classified[first_pick] = True
+        classified_indices.append(first_pick)
+
+        human_labels = df.iloc[first_pick]["human_labels"]
+        count_labels(human_labels, known_labels, class_counts)
+
+        num_groundtruth_steps = steps - 1  # first was warm start
+
+    for step in range(num_groundtruth_steps):
+        next_idx, target_class = get_next_groundtruth(
+            all_embeddings,
+            all_embeddings_norm,
+            is_classified,
+            df,
+            class_counts,
+            classified_indices,
+            window_size,
+            dropped_classes=dropped_classes,
+        )
+
+        if next_idx is None:
+            raise ValueError(f"Groundtruth returned None at step {step}")
+
+        is_classified[next_idx] = True
+        classified_indices.append(next_idx)
+
+        human_labels = df.iloc[next_idx]["human_labels"]
+        count_labels(human_labels, known_labels, class_counts)
+
+        hit = target_class in human_labels
+        # human_labels can be a list-like or numpy array; avoid ambiguous truth checks
+        if human_labels is None:
+            first_label = None
+        else:
+            first_label = human_labels[0] if len(human_labels) > 0 else None
+        hit_log.append((target_class, first_label, hit))
+
+        # Update per-class attempts / hits
+        attempts_per_class[target_class] = attempts_per_class.get(target_class, 0) + 1
+        if hit:
+            hits_per_class[target_class] = hits_per_class.get(target_class, 0) + 1
+
+        attempts = attempts_per_class[target_class]
+        hits = hits_per_class.get(target_class, 0)
+
+        # Decide whether to drop this label using Bayesian rule
+        if should_drop_label_bayesian(
+            hits=hits,
+            attempts=attempts,
+            min_useful_hit_rate=GROUNDTRUTH_MIN_USEFUL_HIT_RATE,
+            confidence=GROUNDTRUTH_DROP_CONFIDENCE,
+        ):
+            dropped_classes.add(target_class)
+
+    return classified_indices, known_labels, class_counts, hit_log
+
+
+# ---------------------------------------------------------------------------
+# Legacy groundtruth utilities (kept for reference, not used by runners yet)
+# ---------------------------------------------------------------------------
+
+# def backfill_counts(df, classified_indices):
+#     """Scan all classified recordings and build accurate label counts."""
+#     known_labels = set()
+#     class_counts = {}
+#     for idx in classified_indices:
+#         for label in df.iloc[idx]["human_labels"]:
+#             if label not in known_labels:
+#                 known_labels.add(label)
+#                 class_counts[label] = 0
+#             class_counts[label] += 1
+#     return known_labels, class_counts
+#
+#
+def analyze_groundtruth_hits(hit_log):
+    """Per-class hit/miss breakdown.
+
+    Each hit_log entry is expected to be:
+        (target_class, actual_first_label, hit_bool)
+
+    Returns a list of dict rows with:
+        target_class, hits, misses, total, hit_rate, cost, miss_detail
+    where cost is defined as total / hits (attempts per successful hit).
+    """
+    from collections import Counter
+
+    targets = sorted(set(t for t, _, _ in hit_log))
+    rows = []
+
+    total_hits = 0
+    total_all = 0
+
+    for cls in targets:
+        entries = [(t, a, h) for t, a, h in hit_log if t == cls]
+        hits = sum(1 for _, _, h in entries if h)
+        misses = len(entries) - hits
+        total = len(entries)
+        hit_rate = hits / total if total > 0 else 0.0
+        cost = (total / hits) if hits > 0 else None
+
+        total_hits += hits
+        total_all += total
+
+        miss_classes = Counter(a for _, a, h in entries if not h)
+        miss_detail = "; ".join(f"{c}: {n}" for c, n in miss_classes.most_common())
+
+        rows.append(
+            {
+                "target_class": cls,
+                "hits": hits,
+                "misses": misses,
+                "total": total,
+                "hit_rate": round(hit_rate, 4),
+                "cost": round(cost, 2) if cost is not None else None,
+                "miss_detail": miss_detail if miss_detail else "-",
+            }
+        )
+
+    overall_rate = total_hits / total_all if total_all > 0 else 0.0
+    overall_cost = (total_all / total_hits) if total_hits > 0 else None
+    rows.append(
+        {
+            "target_class": "OVERALL",
+            "hits": total_hits,
+            "misses": total_all - total_hits,
+            "total": total_all,
+            "hit_rate": round(overall_rate, 4),
+            "cost": round(overall_cost, 2) if overall_cost is not None else None,
+            "miss_detail": "-",
+        }
+    )
+
+    return rows

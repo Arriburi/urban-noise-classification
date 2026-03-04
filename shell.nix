@@ -11,12 +11,11 @@ in pkgs.mkShell {
     python
     pkgs.python312Packages.pip
     pkgs.python312Packages.virtualenv
-
     # Development tools
     pkgs.ruff      # Python linter/formatter
 
     # System dependencies
-    pkgs.ffmpeg
+    pkgs.ffmpeg_6-full
     pkgs.graphviz
     pkgs.portaudio
     pkgs.zlib
@@ -43,6 +42,9 @@ in pkgs.mkShell {
     # Install the project in editable mode (reads pyproject.toml)
     pip install -e .
 
+    # Install test dependencies into the virtualenv
+    pip install pytest
+
     # Install development tools
     pip install visidata
 
@@ -64,5 +66,5 @@ in pkgs.mkShell {
   '';
 
   # Set environment variables for libraries
-  LD_LIBRARY_PATH = "${pkgs.stdenv.cc.cc.lib}/lib:${pkgs.portaudio}/lib:${pkgs.zlib}/lib";
+  LD_LIBRARY_PATH = "${pkgs.stdenv.cc.cc.lib}/lib:${pkgs.portaudio}/lib:${pkgs.zlib}/lib:${pkgs.ffmpeg_6-full}/lib";
 }

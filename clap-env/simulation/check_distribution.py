@@ -1,31 +1,29 @@
-"""
-One CSV per mode. Base written to base.csv. Config: which window for groundtruth and mean.
-"""
-from pathlib import Path
 import re
 import shutil
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 from scipy.stats import entropy as scipy_entropy
 
-# Which window to use for groundtruth and mean (all other windows ignored).
-GT_WINDOW = 15
-MEAN_WINDOW = 250
 
-CLASS_NAMES = [
-    "Human sounds",
-    "Animal",
-    "Music",
-    "Natural sounds",
-    "Source-ambiguous sounds",
-    "Channel, environment and background",
-    "Sounds of things",
-]
-C = len(CLASS_NAMES)
-UNIFORM_PCT = 100.0 / C
+SCRIPT_DIR = Path(__file__).parent
+OUTPUTS_DIR = SCRIPT_DIR / "outputs"
+RESULTS_DIR = SCRIPT_DIR / "distribution_results"
 
-MODES = ["random", "similar", "diverse", "groundtruth", "mean"]
+# --- Config: edit these to change base parquet, simulations, and output names ---
+BASE_PARQUET = SCRIPT_DIR / "audioset_eval_mid.parquet"
+# Hybrid config: varying total steps, varying diverse steps.
+# Filenames like: mid_hybrid_2000_d300_n15_seed1.parquet, mid_hybrid_3000_d1000_n15_seed2.parquet, ...
+# We group results by the DIVERSE phase length (the "dXXX" part).
+SIM_GLOB = "mid_hybrid_*_d*_n15_seed*.parquet"
+PARSE_PATTERN = re.compile(r"^mid_hybrid_\d+_d(\d+)_n15_seed(\d+)\.parquet$")
+PLOTS_METHOD_NAME = "hybrid_d"  # Outputs hybrid_d300, hybrid_d1000, ...
+
+# Previous diverse-only config (kept here for reference):
+# SIM_GLOB = "mid_diverse_*.parquet"
+# PARSE_PATTERN = re.compile(r"^mid_diverse_(\d+)_seed(\d+)\.parquet$")
+# PLOTS_METHOD_NAME = "diverse"  # Used for {method}.csv and {method}_summary.csv (plots.py expects: diverse, random, groundtruth_15, mean_250, similar)
 
 
 def get_distribution(file_path: Path) -> tuple[pd.Series, int]:
@@ -38,141 +36,140 @@ def get_distribution(file_path: Path) -> tuple[pd.Series, int]:
     return counts, len(df)
 
 
-def pct_vector(counts: pd.Series, total: int) -> np.ndarray:
-    out = np.zeros(C)
+def pct_vector(counts: pd.Series, total: int, all_labels: list[str]) -> np.ndarray:
+    out = np.zeros(len(all_labels))
     if total <= 0:
         return out
-    for i, label in enumerate(CLASS_NAMES):
+    for i, label in enumerate(all_labels):
         out[i] = counts.get(label, 0) / total * 100.0
     return out
 
 
-def imbalance(pct: np.ndarray) -> float:
-    return float(np.mean(np.abs(pct - UNIFORM_PCT)))
+def imbalance(pct: np.ndarray, n_classes: int) -> float:
+    uniform_pct = 100.0 / n_classes if n_classes > 0 else 0.0
+    return float(np.mean(np.abs(pct - uniform_pct)))
 
 
 def shift(pct: np.ndarray, base_pct: np.ndarray) -> float:
     return float(np.mean(np.abs(pct - base_pct)))
 
 
-def parse_parquet_name(name: str) -> tuple[str | None, int | None, int | None]:
-    """Return (mode, window, seed). mode in MODES; window None for random/similar/diverse."""
-    name = name.replace("top_mixed_no_mixed_", "").replace(".parquet", "")
-    # groundtruth_n15_1575_seed3 -> groundtruth, 15, 3
-    # random_1575_seed2 -> random, None, 2
-    seed_m = re.search(r"seed(\d+)$", name)
-    seed = int(seed_m.group(1)) if seed_m else None
-    window = None
-    if "groundtruth" in name or "mean" in name:
-        w_m = re.search(r"n(\d+)", name)
-        window = int(w_m.group(1)) if w_m else None
-    if "groundtruth" in name:
-        return ("groundtruth", window, seed)
-    if "mean" in name:
-        return ("mean", window, seed)
-    if name.startswith("random"):
-        return ("random", None, seed)
-    if name.startswith("similar"):
-        return ("similar", None, seed)
-    if name.startswith("diverse"):
-        return ("diverse", None, seed)
-    return (None, None, None)
+def compute_entropy(pct: np.ndarray, n_classes: int) -> float:
+    s = pct.sum()
+    probs = (pct / s) if s > 0 else np.ones(n_classes) / n_classes
+    return float(scipy_entropy(probs, base=2))
 
 
-def build_table(columns: dict[str, tuple[pd.Series, int]], base_pct: np.ndarray) -> pd.DataFrame:
-    """columns: seed1 -> (counts, total), etc. Rows: CLASS_NAMES + ENTROPY, IMBALANCE, SHIFT."""
-    rows = []
-    for label in CLASS_NAMES:
-        row = {"label": label}
-        for col_name, (counts, total) in columns.items():
-            c = counts.get(label, 0)
-            p = (c / total * 100.0) if total > 0 else 0.0
-            row[col_name] = f"{c} ({p:.1f}%)"
-        rows.append(row)
-    ent_row = {"label": "ENTROPY"}
-    imb_row = {"label": "IMBALANCE"}
-    shf_row = {"label": "SHIFT"}
-    for col_name, (counts, total) in columns.items():
-        pct = pct_vector(counts, total)
-        s = pct.sum()
-        probs = (pct / s) if s > 0 else np.ones(C) / C
-        ent_row[col_name] = f"{scipy_entropy(probs, base=2):.3f}"
-        imb_row[col_name] = f"{imbalance(pct):.3f}"
-        shf_row[col_name] = f"{shift(pct, base_pct):.3f}"
-    rows.extend([ent_row, imb_row, shf_row])
-    return pd.DataFrame(rows).set_index("label")
+def parse_simulation_name(name: str, pattern: re.Pattern) -> tuple[int | None, int | None]:
+    """Return (steps, seed) or (None, None). Pattern must have two groups: steps, seed."""
+    m = pattern.match(name)
+    if not m:
+        return None, None
+    return int(m.group(1)), int(m.group(2))
 
 
-def main():
-    script_dir = Path(__file__).parent
-    outputs_dir = script_dir / "outputs"
-    results_dir = script_dir / "distribution_results"
-    if results_dir.exists():
-        shutil.rmtree(results_dir)
-    results_dir.mkdir(parents=True, exist_ok=True)
+def main() -> None:
+    if not BASE_PARQUET.exists():
+        print(f"Base parquet not found: {BASE_PARQUET}")
+        return
+    if not OUTPUTS_DIR.exists():
+        print(f"Outputs dir not found: {OUTPUTS_DIR}")
+        return
 
-    base_path = script_dir / "audioset_eval_top_mixed_no_mixed.parquet"
-    base_counts, base_total = get_distribution(base_path)
-    base_pct = pct_vector(base_counts, base_total)
+    if RESULTS_DIR.exists():
+        shutil.rmtree(RESULTS_DIR)
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
-    # One dict per mode: column name -> (counts, total). Column name = seed{N}.
-    by_mode: dict[str, dict[str, tuple[pd.Series, int]]] = {m: {} for m in MODES}
+    base_counts, base_total = get_distribution(BASE_PARQUET)
+    all_labels = sorted(base_counts.index.tolist())
+    n_classes = len(all_labels)
+    base_pct = pct_vector(base_counts, base_total, all_labels)
+    base_entropy = compute_entropy(base_pct, n_classes)
+    base_imbalance = imbalance(base_pct, n_classes)
 
-    for path in sorted(outputs_dir.glob("top_mixed_no_mixed_*.parquet")):
-        mode, window, seed = parse_parquet_name(path.name)
-        if mode is None or seed is None:
-            continue
-        if mode == "groundtruth" and window != GT_WINDOW:
-            continue
-        if mode == "mean" and window != MEAN_WINDOW:
-            continue
-        col = f"seed{seed}"
-        by_mode[mode][col] = get_distribution(path)
+    # Labels ordered by count descending (for readable bar charts)
+    labels_by_count = sorted(
+        all_labels,
+        key=lambda L: base_counts.get(L, 0),
+        reverse=True,
+    )
 
-    # Base
-    build_table({"base": (base_counts, base_total)}, base_pct).to_csv(results_dir / "base.csv")
+    # --- base.csv: rows = labels + ENTROPY, IMBALANCE, SHIFT; column "base" ---
+    # Format matches old git: class rows "c (p%)", metrics ".3f" strings
+    base_data = {}
+    for label in labels_by_count:
+        c = base_counts.get(label, 0)
+        p = (c / base_total * 100.0) if base_total > 0 else 0.0
+        base_data[label] = f"{c} ({p:.1f}%)"
+    base_data["ENTROPY"] = f"{base_entropy:.3f}"
+    base_data["IMBALANCE"] = f"{base_imbalance:.3f}"
+    base_data["SHIFT"] = "0.000"  # base has no shift to itself
+    base_df = pd.DataFrame({"base": base_data})
+    base_df.to_csv(RESULTS_DIR / "base.csv")
     print("base -> base.csv")
 
-    # One CSV per mode, columns sorted seed1..seed30
-    mode_csv_files = {}
-    for mode in MODES:
-        cols = by_mode[mode]
-        if not cols:
+    # Group simulations by (diverse) steps
+    by_steps: dict[int, list[tuple[int, Path]]] = {}
+    for path in sorted(OUTPUTS_DIR.glob(SIM_GLOB)):
+        steps, seed = parse_simulation_name(path.name, PARSE_PATTERN)
+        if steps is None or seed is None:
             continue
-        ordered = dict(sorted(cols.items(), key=lambda x: int(x[0].replace("seed", ""))))
-        if mode == "groundtruth":
-            out_name = f"groundtruth_{GT_WINDOW}.csv"
-        elif mode == "mean":
-            out_name = f"mean_{MEAN_WINDOW}.csv"
-        else:
-            out_name = f"{mode}.csv"
-        csv_path = results_dir / out_name
-        build_table(ordered, base_pct).to_csv(csv_path)
-        mode_csv_files[mode] = csv_path
-        print(f"{mode}: {len(ordered)} runs -> {out_name}")
+        if steps not in by_steps:
+            by_steps[steps] = []
+        by_steps[steps].append((seed, path))
 
-    # Generate summary files: class average % (from exact counts) + mean ± std for ENTROPY, IMBALANCE, SHIFT
-    for mode in MODES:
-        if mode not in mode_csv_files:
-            continue
-        csv_path = mode_csv_files[mode]
-        ordered = dict(sorted(by_mode[mode].items(), key=lambda x: int(x[0].replace("seed", ""))))
-        df = pd.read_csv(csv_path, index_col=0)
-        metrics = ["ENTROPY", "IMBALANCE", "SHIFT"]
-        missing_metrics = [m for m in metrics if m not in df.index]
-        if missing_metrics:
-            print(f"Warning: {mode} CSV missing metrics: {missing_metrics}. Skipping summary.")
-            continue
+    if not by_steps:
+        print("No simulation parquets found.")
+        return
 
-        # Class average % from exact counts (no parsing)
+    # For hybrid, "steps" here is the diverse phase length (e.g. 300/400/500/750)
+    for steps in sorted(by_steps.keys()):
+        entries = sorted(by_steps[steps], key=lambda x: x[0])
+        method_name = f"{PLOTS_METHOD_NAME}{steps}"
+
+        # Build method CSV: rows = labels + ENTROPY, IMBALANCE, SHIFT; columns = seed1, seed2, ...
+        method_cols = {}
+        pct_arrays = []  # for computing mean per label
+        entropies = []
+
+        for seed, path in entries:
+            col_name = f"seed{seed}"
+            counts, recordings = get_distribution(path)
+            pct = pct_vector(counts, recordings, all_labels)
+            pct_arrays.append(pct)
+            ent = compute_entropy(pct, n_classes)
+            imb = imbalance(pct, n_classes)
+            shf = shift(pct, base_pct)
+            entropies.append(ent)
+
+            col_data = {}
+            for label in labels_by_count:
+                idx = all_labels.index(label)
+                c = counts.get(all_labels[idx], 0)
+                p = pct[idx]
+                col_data[label] = f"{c} ({p:.1f}%)"
+            col_data["ENTROPY"] = f"{ent:.3f}"
+            col_data["IMBALANCE"] = f"{imb:.3f}"
+            col_data["SHIFT"] = f"{shf:.3f}"
+            method_cols[col_name] = col_data
+
+        method_df = pd.DataFrame(method_cols)
+        method_df.to_csv(RESULTS_DIR / f"{method_name}.csv")
+        print(f"{method_name} ({steps} diverse steps, {len(entries)} seeds) -> {method_name}.csv")
+        print(f"  entropy: {[round(e, 4) for e in entropies]}")
+
+        pct_stack = np.stack(pct_arrays)
+        # --- {method}_summary.csv: full old-format (mean, std, mean-std, mean+std, min, max) ---
+        ordered_cols = dict(sorted(method_cols.items(), key=lambda x: int(x[0].replace("seed", ""))))
+        metric_arrays = {m: [] for m in ["ENTROPY", "IMBALANCE", "SHIFT"]}
+        for col_name, col_data in ordered_cols.items():
+            for m in metric_arrays:
+                metric_arrays[m].append(float(col_data[m]))
+
         summary_rows = []
-        for label in CLASS_NAMES:
-            pcts = []
-            for (counts, total) in ordered.values():
-                if total > 0:
-                    pcts.append(counts.get(label, 0) / total * 100.0)
-                else:
-                    pcts.append(0.0)
+        for label in labels_by_count:
+            idx = all_labels.index(label)
+            pcts = pct_stack[:, idx]
             arr = np.array(pcts)
             mean_pct = float(np.mean(arr))
             std_pct = float(np.std(arr, ddof=1)) if len(arr) > 1 else 0.0
@@ -185,24 +182,12 @@ def main():
                 "min": f"{float(np.min(arr)):.4f}",
                 "max": f"{float(np.max(arr)):.4f}",
             })
-
-        for metric in metrics:
-            values = []
-            for col in df.columns:
-                if col.startswith("seed"):
-                    try:
-                        values.append(float(df.loc[metric, col]))
-                    except (ValueError, KeyError):
-                        print(f"Warning: {mode} CSV, {metric} row, column {col}: could not parse value.")
-                        continue
-            if not values:
-                print(f"Warning: {mode} CSV, {metric} row: no valid seed values found. Skipping summary.")
-                continue
-            arr = np.array(values)
+        for m in ["ENTROPY", "IMBALANCE", "SHIFT"]:
+            arr = np.array(metric_arrays[m])
             mean_val = float(np.mean(arr))
-            std_val = float(np.std(arr, ddof=1))  # ddof=1: sample std (n-1 divisor, correct for 30 seeds)
+            std_val = float(np.std(arr, ddof=1)) if len(arr) > 1 else 0.0
             summary_rows.append({
-                "metric": metric,
+                "metric": m,
                 "mean": f"{mean_val:.4f}",
                 "std": f"{std_val:.4f}",
                 "mean-std": f"{mean_val - std_val:.4f}",
@@ -211,16 +196,10 @@ def main():
                 "max": f"{float(np.max(arr)):.4f}",
             })
         summary_df = pd.DataFrame(summary_rows).set_index("metric")
-        if mode == "groundtruth":
-            summary_name = f"groundtruth_{GT_WINDOW}_summary.csv"
-        elif mode == "mean":
-            summary_name = f"mean_{MEAN_WINDOW}_summary.csv"
-        else:
-            summary_name = f"{mode}_summary.csv"
-        summary_df.to_csv(results_dir / summary_name)
-        print(f"{mode}: summary -> {summary_name}")
+        summary_df.to_csv(RESULTS_DIR / f"{method_name}_summary.csv")
+        print(f"{method_name}: summary -> {method_name}_summary.csv")
 
-    print(f"\nResults in: {results_dir}")
+    print(f"\nResults in: {RESULTS_DIR}")
 
 
 if __name__ == "__main__":
