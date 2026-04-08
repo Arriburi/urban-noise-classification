@@ -4,26 +4,64 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import matplotlib.pyplot as plt
 from scipy.stats import entropy as scipy_entropy
 
 
 SCRIPT_DIR = Path(__file__).parent
 OUTPUTS_DIR = SCRIPT_DIR / "outputs"
 RESULTS_DIR = SCRIPT_DIR / "distribution_results"
+PLOTS_DIR = SCRIPT_DIR / "plots"
 
-# --- Config: edit these to change base parquet, simulations, and output names ---
 BASE_PARQUET = SCRIPT_DIR / "audioset_eval_mid.parquet"
-# Hybrid config: varying total steps, varying diverse steps.
-# Filenames like: mid_hybrid_2000_d300_n15_seed1.parquet, mid_hybrid_3000_d1000_n15_seed2.parquet, ...
-# We group results by the DIVERSE phase length (the "dXXX" part).
-SIM_GLOB = "mid_hybrid_*_d*_n15_seed*.parquet"
-PARSE_PATTERN = re.compile(r"^mid_hybrid_\d+_d(\d+)_n15_seed(\d+)\.parquet$")
-PLOTS_METHOD_NAME = "hybrid_d"  # Outputs hybrid_d300, hybrid_d1000, ...
 
-# Previous diverse-only config (kept here for reference):
-# SIM_GLOB = "mid_diverse_*.parquet"
-# PARSE_PATTERN = re.compile(r"^mid_diverse_(\d+)_seed(\d+)\.parquet$")
-# PLOTS_METHOD_NAME = "diverse"  # Used for {method}.csv and {method}_summary.csv (plots.py expects: diverse, random, groundtruth_15, mean_250, similar)
+# --- Strategies to process ---
+# Each entry: (glob_pattern, parse_regex, method_name)
+# Only processes files matching the specified step counts
+TARGET_STEPS = {2000}
+
+STRATEGIES = [
+    (
+        "mid_random_*_seed*.parquet",
+        re.compile(r"^mid_random_(\d+)_seed(\d+)\.parquet$"),
+        "random",
+    ),
+    (
+        "mid_diverse_*_seed*.parquet",
+        re.compile(r"^mid_diverse_(\d+)_seed(\d+)\.parquet$"),
+        "diverse",
+    ),
+    (
+        "mid_groundtruth_k0_*_seed*.parquet",
+        re.compile(r"^mid_groundtruth_k0_(\d+)_seed(\d+)\.parquet$"),
+        "groundtruth_k0",
+    ),
+    (
+        "mid_groundtruth_k2_*_seed*.parquet",
+        re.compile(r"^mid_groundtruth_k2_(\d+)_seed(\d+)\.parquet$"),
+        "groundtruth_k2",
+    ),
+    (
+        "mid_groundtruth_cold_k2_*_seed*.parquet",
+        re.compile(r"^mid_groundtruth_cold_k2_(\d+)_seed(\d+)\.parquet$"),
+        "groundtruth_cold_k2",
+    ),
+    (
+        "mid_kmeans_hybrid_km57_k2_*_seed*.parquet",
+        re.compile(r"^mid_kmeans_hybrid_km57_k2_(\d+)_seed(\d+)\.parquet$"),
+        "kmeans_hybrid_km57",
+    ),
+    (
+        "mid_kmeans_hybrid_km100_k2_*_seed*.parquet",
+        re.compile(r"^mid_kmeans_hybrid_km100_k2_(\d+)_seed(\d+)\.parquet$"),
+        "kmeans_hybrid_km100",
+    ),
+    (
+        "mid_kmeans_hybrid_km150_k2_*_seed*.parquet",
+        re.compile(r"^mid_kmeans_hybrid_km150_k2_(\d+)_seed(\d+)\.parquet$"),
+        "kmeans_hybrid_km150",
+    ),
+]
 
 
 def get_distribution(file_path: Path) -> tuple[pd.Series, int]:
@@ -61,75 +99,47 @@ def compute_entropy(pct: np.ndarray, n_classes: int) -> float:
 
 
 def parse_simulation_name(name: str, pattern: re.Pattern) -> tuple[int | None, int | None]:
-    """Return (steps, seed) or (None, None). Pattern must have two groups: steps, seed."""
     m = pattern.match(name)
     if not m:
         return None, None
     return int(m.group(1)), int(m.group(2))
 
 
-def main() -> None:
-    if not BASE_PARQUET.exists():
-        print(f"Base parquet not found: {BASE_PARQUET}")
-        return
-    if not OUTPUTS_DIR.exists():
-        print(f"Outputs dir not found: {OUTPUTS_DIR}")
-        return
-
-    if RESULTS_DIR.exists():
-        shutil.rmtree(RESULTS_DIR)
-    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-
-    base_counts, base_total = get_distribution(BASE_PARQUET)
-    all_labels = sorted(base_counts.index.tolist())
-    n_classes = len(all_labels)
-    base_pct = pct_vector(base_counts, base_total, all_labels)
-    base_entropy = compute_entropy(base_pct, n_classes)
-    base_imbalance = imbalance(base_pct, n_classes)
-
-    # Labels ordered by count descending (for readable bar charts)
-    labels_by_count = sorted(
-        all_labels,
-        key=lambda L: base_counts.get(L, 0),
-        reverse=True,
-    )
-
-    # --- base.csv: rows = labels + ENTROPY, IMBALANCE, SHIFT; column "base" ---
-    # Format matches old git: class rows "c (p%)", metrics ".3f" strings
-    base_data = {}
-    for label in labels_by_count:
-        c = base_counts.get(label, 0)
-        p = (c / base_total * 100.0) if base_total > 0 else 0.0
-        base_data[label] = f"{c} ({p:.1f}%)"
-    base_data["ENTROPY"] = f"{base_entropy:.3f}"
-    base_data["IMBALANCE"] = f"{base_imbalance:.3f}"
-    base_data["SHIFT"] = "0.000"  # base has no shift to itself
-    base_df = pd.DataFrame({"base": base_data})
-    base_df.to_csv(RESULTS_DIR / "base.csv")
-    print("base -> base.csv")
-
-    # Group simulations by (diverse) steps
+def process_strategy(
+    sim_glob: str,
+    parse_pattern: re.Pattern,
+    method_name: str,
+    base_counts: pd.Series,
+    base_total: int,
+    all_labels: list[str],
+    labels_by_count: list[str],
+    base_pct: np.ndarray,
+    n_classes: int,
+) -> None:
+    # Group files by steps
     by_steps: dict[int, list[tuple[int, Path]]] = {}
-    for path in sorted(OUTPUTS_DIR.glob(SIM_GLOB)):
-        steps, seed = parse_simulation_name(path.name, PARSE_PATTERN)
+    for path in sorted(OUTPUTS_DIR.glob(sim_glob)):
+        steps, seed = parse_simulation_name(path.name, parse_pattern)
         if steps is None or seed is None:
             continue
-        if steps not in by_steps:
-            by_steps[steps] = []
-        by_steps[steps].append((seed, path))
+        if steps not in TARGET_STEPS:
+            continue
+        by_steps.setdefault(steps, []).append((seed, path))
 
     if not by_steps:
-        print("No simulation parquets found.")
+        print(f"  No files found for {method_name}")
         return
 
-    # For hybrid, "steps" here is the diverse phase length (e.g. 300/400/500/750)
+    total_files = sum(len(v) for v in by_steps.values())
+    print(f"\n--- {method_name} ---")
+    print(f"  Found {total_files} files, step configs: {sorted(by_steps.keys())}")
+
     for steps in sorted(by_steps.keys()):
         entries = sorted(by_steps[steps], key=lambda x: x[0])
-        method_name = f"{PLOTS_METHOD_NAME}{steps}"
+        full_name = f"{method_name}_{steps}"
 
-        # Build method CSV: rows = labels + ENTROPY, IMBALANCE, SHIFT; columns = seed1, seed2, ...
         method_cols = {}
-        pct_arrays = []  # for computing mean per label
+        pct_arrays = []
         entropies = []
 
         for seed, path in entries:
@@ -153,13 +163,13 @@ def main() -> None:
             col_data["SHIFT"] = f"{shf:.3f}"
             method_cols[col_name] = col_data
 
+        # Per-seed CSV
         method_df = pd.DataFrame(method_cols)
-        method_df.to_csv(RESULTS_DIR / f"{method_name}.csv")
-        print(f"{method_name} ({steps} diverse steps, {len(entries)} seeds) -> {method_name}.csv")
-        print(f"  entropy: {[round(e, 4) for e in entropies]}")
+        method_df.to_csv(RESULTS_DIR / f"{full_name}.csv")
+        print(f"  {full_name}.csv ({len(entries)} seeds)")
 
+        # Summary CSV
         pct_stack = np.stack(pct_arrays)
-        # --- {method}_summary.csv: full old-format (mean, std, mean-std, mean+std, min, max) ---
         ordered_cols = dict(sorted(method_cols.items(), key=lambda x: int(x[0].replace("seed", ""))))
         metric_arrays = {m: [] for m in ["ENTROPY", "IMBALANCE", "SHIFT"]}
         for col_name, col_data in ordered_cols.items():
@@ -169,8 +179,7 @@ def main() -> None:
         summary_rows = []
         for label in labels_by_count:
             idx = all_labels.index(label)
-            pcts = pct_stack[:, idx]
-            arr = np.array(pcts)
+            arr = np.array(pct_stack[:, idx])
             mean_pct = float(np.mean(arr))
             std_pct = float(np.std(arr, ddof=1)) if len(arr) > 1 else 0.0
             summary_rows.append({
@@ -195,11 +204,102 @@ def main() -> None:
                 "min": f"{float(np.min(arr)):.4f}",
                 "max": f"{float(np.max(arr)):.4f}",
             })
-        summary_df = pd.DataFrame(summary_rows).set_index("metric")
-        summary_df.to_csv(RESULTS_DIR / f"{method_name}_summary.csv")
-        print(f"{method_name}: summary -> {method_name}_summary.csv")
 
-    print(f"\nResults in: {RESULTS_DIR}")
+        label_rows = [r for r in summary_rows if r["metric"] not in {"ENTROPY", "IMBALANCE", "SHIFT"}]
+        metric_rows = [r for r in summary_rows if r["metric"] in {"ENTROPY", "IMBALANCE", "SHIFT"}]
+        label_rows.sort(key=lambda r: float(r["mean"]), reverse=True)
+        ordered_rows = label_rows + metric_rows
+
+        summary_df = pd.DataFrame(ordered_rows).set_index("metric")
+        summary_df.to_csv(RESULTS_DIR / f"{full_name}_summary.csv")
+        print(f"  {full_name}_summary.csv")
+
+        # Metrics CSV + LaTeX
+        metric_rows_only = [r for r in ordered_rows if r["metric"] in {"ENTROPY", "IMBALANCE", "SHIFT"}]
+        metrics_table = pd.DataFrame([
+            {
+                "Metric": r["metric"].capitalize(),
+                "Mean": r["mean"],
+                "Std": r["std"],
+                "Min": r["min"],
+                "Max": r["max"],
+            }
+            for r in metric_rows_only
+        ])
+        metrics_table.to_csv(RESULTS_DIR / f"{full_name}_metrics.csv", index=False)
+        metrics_table.to_latex(
+            RESULTS_DIR / f"{full_name}_metrics.tex",
+            index=False,
+            float_format="%.4f",
+            caption=f"Distribution metrics -- {full_name.replace('_', ' ')} ({steps} steps, {len(entries)} seeds)",
+            label=f"tab:{full_name}_metrics",
+        )
+        print(f"  {full_name}_metrics.csv + .tex")
+
+        # Label distribution bar chart
+        label_rows_sorted = sorted(label_rows, key=lambda r: float(r["mean"]), reverse=True)
+        class_names = [r["metric"] for r in label_rows_sorted]
+        means = [float(r["mean"]) for r in label_rows_sorted]
+        stds = [float(r["std"]) for r in label_rows_sorted]
+
+        fig, ax = plt.subplots(figsize=(max(14, len(class_names) * 0.35), 7))
+        x_pos = np.arange(len(class_names))
+        ax.bar(x_pos, means, yerr=stds, align='center', capsize=3, color='steelblue', alpha=0.8)
+        ax.set_xticks(x_pos)
+        ax.set_xticklabels(class_names, fontsize=7, rotation=90)
+        ax.set_ylabel('Mean percentage (%)', fontsize=11)
+        ax.set_title(f'Label distribution - {full_name}\n({len(entries)} seeds, {steps} steps)', fontsize=12)
+        ax.grid(axis='y', alpha=0.3)
+        plt.tight_layout()
+        plot_path = PLOTS_DIR / f"{full_name}_label_distribution.png"
+        plt.savefig(plot_path, dpi=150, bbox_inches='tight')
+        plt.close()
+        print(f"  {full_name}_label_distribution.png")
+
+
+def main() -> None:
+    if not BASE_PARQUET.exists():
+        print(f"Base parquet not found: {BASE_PARQUET}")
+        return
+    if not OUTPUTS_DIR.exists():
+        print(f"Outputs dir not found: {OUTPUTS_DIR}")
+        return
+
+    if RESULTS_DIR.exists():
+        shutil.rmtree(RESULTS_DIR)
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    PLOTS_DIR.mkdir(exist_ok=True)
+
+    base_counts, base_total = get_distribution(BASE_PARQUET)
+    all_labels = sorted(base_counts.index.tolist())
+    n_classes = len(all_labels)
+    base_pct = pct_vector(base_counts, base_total, all_labels)
+    base_entropy = compute_entropy(base_pct, n_classes)
+    base_imbalance = imbalance(base_pct, n_classes)
+
+    labels_by_count = sorted(all_labels, key=lambda L: base_counts.get(L, 0), reverse=True)
+
+    # base.csv
+    base_data = {}
+    for label in labels_by_count:
+        c = base_counts.get(label, 0)
+        p = (c / base_total * 100.0) if base_total > 0 else 0.0
+        base_data[label] = f"{c} ({p:.1f}%)"
+    base_data["ENTROPY"] = f"{base_entropy:.3f}"
+    base_data["IMBALANCE"] = f"{base_imbalance:.3f}"
+    base_data["SHIFT"] = "0.000"
+    pd.DataFrame({"base": base_data}).to_csv(RESULTS_DIR / "base.csv")
+    print(f"base.csv (entropy={base_entropy:.4f}, imbalance={base_imbalance:.4f})")
+
+    for sim_glob, parse_pattern, method_name in STRATEGIES:
+        process_strategy(
+            sim_glob, parse_pattern, method_name,
+            base_counts, base_total, all_labels, labels_by_count,
+            base_pct, n_classes,
+        )
+
+    print(f"\nAll results in: {RESULTS_DIR}")
+    print(f"All plots in:   {PLOTS_DIR}")
 
 
 if __name__ == "__main__":

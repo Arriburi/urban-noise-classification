@@ -3,6 +3,9 @@ import pandas as pd
 from scipy.stats import beta as _beta_dist  # type: ignore[attr-defined]
 
 
+GROUNDTRUTH_TOP_K_DOMINANT = 3
+
+
 def normalize(v):
     norm = np.linalg.norm(v, axis=-1, keepdims=True)
     return v / (norm + 1e-12)
@@ -12,7 +15,10 @@ def sliding_window_mean(all_embeddings, classified_indices, window_size):
     if not classified_indices:
         return None
 
-    recent_indices = classified_indices[-window_size:]
+    if window_size is None:
+        recent_indices = classified_indices
+    else:
+        recent_indices = classified_indices[-window_size:]
     embeddings = all_embeddings[recent_indices]
     mean_emb = np.mean(embeddings, axis=0)
     return normalize(mean_emb)
@@ -99,14 +105,28 @@ def get_next_random(df, is_classified):
     return df.index.get_loc(sampled_index)
 
 
+def get_top_k_dominant_labels(class_counts: dict[str, int], target_class: str, top_k: int):
+    items = sorted(class_counts.items(), key=lambda x: x[1], reverse=True)
+    filtered = [(label, count) for label, count in items if label != target_class]
+    if not filtered or top_k <= 0:
+        return []
+    top = filtered[:top_k]
+    total = sum(count for _, count in top)
+    if total <= 0:
+        return []
+    return [(label, count / total) for label, count in top]
+
+
 def get_next_groundtruth(
     all_embeddings,
     all_embeddings_norm,
     is_classified,
-    df,
+    human_labels_by_idx,
     class_counts,
     classified_indices,
+    label_centroid_cache,
     window_size,
+    dominant_window_size=None,
     dropped_classes=None,
 ):
     if dropped_classes is None:
@@ -125,13 +145,17 @@ def get_next_groundtruth(
     min_classes = [cls for cls, count in active_items if count == min_count]
     min_class = np.random.choice(min_classes)
 
-    filtered_indices = []
-    for idx in classified_indices:
-        human_labels = df.iloc[idx]["human_labels"]
-        if min_class in human_labels:
-            filtered_indices.append(idx)
-
-    mean_embedding = sliding_window_mean(all_embeddings, filtered_indices, window_size)
+    # Fast path: no windows -> use incremental cached centroids.
+    if window_size is None:
+        state = label_centroid_cache.get(min_class)
+        mean_embedding = state["mean"] if state is not None else None
+    else:
+        filtered_indices = []
+        for idx in classified_indices:
+            human_labels = human_labels_by_idx[idx]
+            if min_class in human_labels:
+                filtered_indices.append(idx)
+        mean_embedding = sliding_window_mean(all_embeddings, filtered_indices, window_size)
 
     if mean_embedding is None:
         raise ValueError(
@@ -139,10 +163,33 @@ def get_next_groundtruth(
             f"Diverse cold-start phase should have discovered this class."
         )
 
-    similarities = all_embeddings_norm @ mean_embedding
-    similarities[is_classified] = -np.inf
+    # Attraction to target class centroid.
+    scores = all_embeddings_norm @ mean_embedding
 
-    return np.argmax(similarities), min_class
+    # DLR: subtract weighted similarities to top-k dominant class centroids.
+    dominant = get_top_k_dominant_labels(
+        class_counts=class_counts,
+        target_class=min_class,
+        top_k=GROUNDTRUTH_TOP_K_DOMINANT,
+    )
+    for label, weight in dominant:
+        if dominant_window_size is None:
+            dom_state = label_centroid_cache.get(label)
+            dom_centroid = dom_state["mean"] if dom_state is not None else None
+        else:
+            label_indices = []
+            for idx in classified_indices:
+                human_labels = human_labels_by_idx[idx]
+                if label in human_labels:
+                    label_indices.append(idx)
+            dom_centroid = sliding_window_mean(all_embeddings, label_indices, dominant_window_size)
+        if dom_centroid is None:
+            continue
+        penalty = all_embeddings_norm @ dom_centroid
+        scores -= weight * penalty
+
+    scores[is_classified] = -np.inf
+    return int(np.argmax(scores)), min_class
 
 
 def count_labels(human_labels, known_labels, class_counts):
@@ -159,6 +206,7 @@ def run_random_mode(df, all_embeddings_norm, steps, seed):
     known_labels = set()
     class_counts = {}
     classified_indices = []
+    human_labels_by_idx = df["human_labels"].values
 
     for step in range(1, steps + 1):
         next_idx = get_next_random(df, is_classified)
@@ -168,7 +216,7 @@ def run_random_mode(df, all_embeddings_norm, steps, seed):
         is_classified[next_idx] = True
         classified_indices.append(next_idx)
 
-        human_labels = df.iloc[next_idx]["human_labels"]
+        human_labels = human_labels_by_idx[next_idx]
         count_labels(human_labels, known_labels, class_counts)
 
     return classified_indices, known_labels, class_counts
@@ -180,13 +228,14 @@ def run_diverse_mode(df, all_embeddings_norm, steps, seed):
     known_labels = set()
     class_counts = {}
     classified_indices = []
+    human_labels_by_idx = df["human_labels"].values
 
     first_pick_index = df.sample(1).index[0]
     first_pick = df.index.get_loc(first_pick_index)
     is_classified[first_pick] = True
     classified_indices.append(first_pick)
 
-    human_labels = df.iloc[first_pick]["human_labels"]
+    human_labels = human_labels_by_idx[first_pick]
     count_labels(human_labels, known_labels, class_counts)
 
     for step in range(2, steps + 1):
@@ -197,7 +246,7 @@ def run_diverse_mode(df, all_embeddings_norm, steps, seed):
         is_classified[next_idx] = True
         classified_indices.append(next_idx)
 
-        human_labels = df.iloc[next_idx]["human_labels"]
+        human_labels = human_labels_by_idx[next_idx]
         count_labels(human_labels, known_labels, class_counts)
 
     return classified_indices, known_labels, class_counts
@@ -210,6 +259,7 @@ def run_groundtruth_mode(
     steps,
     seed,
     window_size,
+    dominant_window_size=None,
     initial_classified_indices=None,
     initial_known_labels=None,
     initial_class_counts=None,
@@ -229,6 +279,8 @@ def run_groundtruth_mode(
     class_counts = {}
     classified_indices = []
     hit_log = []
+    human_labels_by_idx = df["human_labels"].values
+    label_centroid_cache: dict[str, dict[str, np.ndarray | int]] = {}
 
     # Groundtruth Bayesian drop-threshold configuration
     GROUNDTRUTH_MIN_USEFUL_HIT_RATE = 0.05
@@ -238,6 +290,23 @@ def run_groundtruth_mode(
     attempts_per_class = {}
     hits_per_class = {}
     dropped_classes = set()
+    dropped_at_step = {}
+
+    def update_label_centroid_cache(human_labels, idx: int) -> None:
+        emb = all_embeddings[idx]
+        for label in human_labels:
+            state = label_centroid_cache.get(label)
+            if state is None:
+                label_centroid_cache[label] = {
+                    "mean": normalize(emb),
+                    "count": 1,
+                }
+                continue
+            prev_mean = state["mean"]
+            prev_count = int(state["count"])
+            new_count = prev_count + 1
+            state["mean"] = normalize(update_mean(prev_mean, emb, new_count))
+            state["count"] = new_count
 
     if (
         initial_classified_indices is not None
@@ -250,6 +319,8 @@ def run_groundtruth_mode(
         class_counts = dict(initial_class_counts)
         for idx in classified_indices:
             is_classified[idx] = True
+            human_labels = human_labels_by_idx[idx]
+            update_label_centroid_cache(human_labels, idx)
         num_groundtruth_steps = steps
     else:
         # Warm start: pick one random recording and learn its labels
@@ -258,8 +329,9 @@ def run_groundtruth_mode(
         is_classified[first_pick] = True
         classified_indices.append(first_pick)
 
-        human_labels = df.iloc[first_pick]["human_labels"]
+        human_labels = human_labels_by_idx[first_pick]
         count_labels(human_labels, known_labels, class_counts)
+        update_label_centroid_cache(human_labels, first_pick)
 
         num_groundtruth_steps = steps - 1  # first was warm start
 
@@ -268,10 +340,12 @@ def run_groundtruth_mode(
             all_embeddings,
             all_embeddings_norm,
             is_classified,
-            df,
+            human_labels_by_idx,
             class_counts,
             classified_indices,
+            label_centroid_cache,
             window_size,
+            dominant_window_size=dominant_window_size,
             dropped_classes=dropped_classes,
         )
 
@@ -281,8 +355,9 @@ def run_groundtruth_mode(
         is_classified[next_idx] = True
         classified_indices.append(next_idx)
 
-        human_labels = df.iloc[next_idx]["human_labels"]
+        human_labels = human_labels_by_idx[next_idx]
         count_labels(human_labels, known_labels, class_counts)
+        update_label_centroid_cache(human_labels, next_idx)
 
         hit = target_class in human_labels
         # human_labels can be a list-like or numpy array; avoid ambiguous truth checks
@@ -307,9 +382,11 @@ def run_groundtruth_mode(
             min_useful_hit_rate=GROUNDTRUTH_MIN_USEFUL_HIT_RATE,
             confidence=GROUNDTRUTH_DROP_CONFIDENCE,
         ):
-            dropped_classes.add(target_class)
+            if target_class not in dropped_classes:
+                dropped_classes.add(target_class)
+                dropped_at_step[target_class] = step + 1
 
-    return classified_indices, known_labels, class_counts, hit_log
+    return classified_indices, known_labels, class_counts, hit_log, dropped_at_step
 
 
 # ---------------------------------------------------------------------------
@@ -329,7 +406,7 @@ def run_groundtruth_mode(
 #     return known_labels, class_counts
 #
 #
-def analyze_groundtruth_hits(hit_log):
+def analyze_groundtruth_hits(hit_log, dropped_at_step=None):
     """Per-class hit/miss breakdown.
 
     Each hit_log entry is expected to be:
@@ -340,6 +417,9 @@ def analyze_groundtruth_hits(hit_log):
     where cost is defined as total / hits (attempts per successful hit).
     """
     from collections import Counter
+
+    if dropped_at_step is None:
+        dropped_at_step = {}
 
     targets = sorted(set(t for t, _, _ in hit_log))
     rows = []
@@ -360,6 +440,7 @@ def analyze_groundtruth_hits(hit_log):
 
         miss_classes = Counter(a for _, a, h in entries if not h)
         miss_detail = "; ".join(f"{c}: {n}" for c, n in miss_classes.most_common())
+        dropped_step = dropped_at_step.get(cls, None)
 
         rows.append(
             {
@@ -369,6 +450,7 @@ def analyze_groundtruth_hits(hit_log):
                 "total": total,
                 "hit_rate": round(hit_rate, 4),
                 "cost": round(cost, 2) if cost is not None else None,
+                "dropped_at": dropped_step if dropped_step is not None else "-",
                 "miss_detail": miss_detail if miss_detail else "-",
             }
         )
@@ -383,6 +465,7 @@ def analyze_groundtruth_hits(hit_log):
             "total": total_all,
             "hit_rate": round(overall_rate, 4),
             "cost": round(overall_cost, 2) if overall_cost is not None else None,
+            "dropped_at": "-",
             "miss_detail": "-",
         }
     )
