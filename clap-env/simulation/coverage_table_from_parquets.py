@@ -3,10 +3,13 @@ from glob import glob
 
 import numpy as np
 import pandas as pd
+from rich.console import Console
+from rich.table import Table
+from rich import box
 
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-OUTPUT_DIR = os.path.join(BASE_DIR, "outputs")
+OUTPUT_DIR = os.path.join(BASE_DIR, "simulation_outputs")
 BASE_DATASET_PARQUET = os.path.join(BASE_DIR, "audioset_eval_mid.parquet")
 
 
@@ -19,13 +22,9 @@ def label_universe_size(parquet_path: str) -> int:
     return len(labels)
 
 
-def checkpoints(max_step: int = 1000) -> list[int]:
-    pts = [0]
-    pts.extend(range(10, min(251, max_step + 1), 10))
-    pts.extend(range(300, max_step + 1, 100))
-    if max_step not in pts:
-        pts.append(max_step)
-    return sorted(set(pts))
+def checkpoints(max_step: int = 2000) -> list[int]:
+    pts = [10, 25, 50, 75, 100, 150, 200, 300, 400, 500, 750, 1000, 1500, 2000]
+    return [p for p in pts if p <= max_step]
 
 
 def cumulative_coverage_pct(parquet_path: str, total_labels: int, max_step: int) -> np.ndarray:
@@ -58,22 +57,34 @@ def summarize_strategy(
 
 
 def main() -> None:
-    max_step = 1000
+    max_step = 2000
     cps = checkpoints(max_step)
 
     strategy_patterns = {
-        "random_2000": os.path.join(OUTPUT_DIR, "mid_random_2000_seed*.parquet"),
-        "diverse_1000": os.path.join(OUTPUT_DIR, "mid_diverse_1000_seed*.parquet"),
+        "random": os.path.join(
+            OUTPUT_DIR, "mid_random_2000_seed*.parquet"
+        ),
+        "kmeans_random_km57": os.path.join(
+            OUTPUT_DIR, "mid_kmeans_random_km57_2000_seed*.parquet"
+        ),
+        "balanced_partition_57": os.path.join(
+            OUTPUT_DIR, "mid_balanced_partition_km57_2000_seed*.parquet"
+        ),
     }
 
-    strategy_files = {name: sorted(glob(pattern)) for name, pattern in strategy_patterns.items()}
-    missing = [name for name, files in strategy_files.items() if not files]
+    # Only include strategies that have matching files — skip missing ones gracefully.
+    strategy_files = {
+        name: sorted(glob(pattern))
+        for name, pattern in strategy_patterns.items()
+        if sorted(glob(pattern))
+    }
+    missing = [name for name in strategy_patterns if name not in strategy_files]
     if missing:
-        raise FileNotFoundError(f"No files matched for: {missing}")
+        raise FileNotFoundError(
+            "No files matched for required strategy/strategies: " + ", ".join(missing)
+        )
 
     total_labels = label_universe_size(BASE_DATASET_PARQUET)
-    if "random_2000" not in strategy_files:
-        raise ValueError("`random_2000` must be present as baseline column.")
 
     means: dict[str, np.ndarray] = {}
     mean_stds: dict[str, float] = {}
@@ -86,37 +97,59 @@ def main() -> None:
     for name in strategy_files:
         table[name] = means[name]
 
-    random_col = "random_2000"
+    baseline = "random"
+    if baseline not in table:
+        raise ValueError("`random` must be present to compute delta columns.")
+
     for name in strategy_files:
-        if name == random_col:
-            continue        # examples:
+        if name == baseline:
+            continue
+        table[f"delta_{name}_vs_random"] = table[name] - table[baseline]
 
-        table[f"delta_vs_random_{name}"] = table[name] - table[random_col]
-
-    avg_std_row = {"step": "avg_std_across_steps"}
+    avg_std_row = {"step": "avg_std"}
     for name in strategy_files:
         avg_std_row[name] = mean_stds[name]
     for name in strategy_files:
-        if name == random_col:
-            continue
-        avg_std_row[f"delta_vs_random_{name}"] = np.nan
+        if name != baseline:
+            avg_std_row[f"delta_{name}_vs_random"] = np.nan
     table = pd.concat([table, pd.DataFrame([avg_std_row])], ignore_index=True)
 
-    with pd.option_context("display.max_columns", None, "display.width", 240):
-        printable = table.copy()
-        for col in printable.columns:
-            if col == "step":
-                continue
-            values = pd.to_numeric(printable[col], errors="coerce")
-            if col.startswith("delta_vs_random_"):
-                printable[col] = values.map(lambda x: "" if pd.isna(x) else f"{x:+.2f}")
-            else:
-                printable[col] = values.round(2)
-        print(printable.to_string(index=False))
+    console = Console()
+    coverage_cols = ["step"] + [name for name in strategy_files.keys()]
+    delta_cols = ["step"] + [col for col in table.columns if col.startswith("delta_")]
 
-    print(f"Total labels in base dataset: {total_labels}")
+    def print_rich_table(df: pd.DataFrame, title: str) -> None:
+        rich_table = Table(title=title, box=box.SIMPLE_HEAVY, show_lines=False)
+        for col in df.columns:
+            rich_table.add_column(str(col), justify="right")
+
+        for _, row in df.iterrows():
+            cells = []
+            for col in df.columns:
+                val = row[col]
+                if col == "step":
+                    cells.append(str(val))
+                elif col.startswith("delta_"):
+                    num = pd.to_numeric(val, errors="coerce")
+                    if pd.isna(num):
+                        cells.append("")
+                    elif num > 0:
+                        cells.append(f"[green]{num:+.2f}[/green]")
+                    elif num < 0:
+                        cells.append(f"[red]{num:+.2f}[/red]")
+                    else:
+                        cells.append(f"{num:+.2f}")
+                else:
+                    num = pd.to_numeric(val, errors="coerce")
+                    cells.append("" if pd.isna(num) else f"{num:.2f}")
+            rich_table.add_row(*cells)
+        console.print(rich_table)
+
+    print_rich_table(table[coverage_cols], "AudioSet Mid Coverage Over Time")
+    print_rich_table(table[delta_cols], "Delta vs Random")
+    console.print(f"Total labels in base dataset: {total_labels}")
     for name, files in strategy_files.items():
-        print(f"{name}: {len(files)} files")
+        console.print(f"{name}: {len(files)} files")
 
 
 if __name__ == "__main__":

@@ -1,172 +1,162 @@
+"""Compare final entropy across top-k groundtruth configurations."""
+
+from __future__ import annotations
+
 import os
 from collections import Counter
 
+import matplotlib
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
 from scipy.stats import entropy
+
+matplotlib.use("Agg")
 
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-OUTPUT_DIR = os.path.join(BASE_DIR, "outputs")
+OUTPUT_DIR = os.environ.get(
+    "TOPK_OUTPUT_DIR",
+    os.path.join(BASE_DIR, "thesis_seeded", "simulation_outputs"),
+)
+PLOTS_DIR = os.environ.get(
+    "TOPK_PLOTS_DIR",
+    os.path.join(BASE_DIR, "thesis_seeded", "plots"),
+)
 
-# Configuration
-STEPS = 1500
-MODE = "groundtruth"
-TOP_K_VALUES = [0, 1, 2, 3, 5, 10]
-SEEDS = list(range(1, 11))
-
-
-def compute_entropy_at_step(labels_up_to_step):
-    if not labels_up_to_step:
-        return 0.0
-    
-    counter = Counter(labels_up_to_step)
-    counts = np.array(list(counter.values()))
-    probabilities = counts / counts.sum()
-    
-    return entropy(probabilities, base=2)
+STEPS = int(os.environ.get("TOPK_STEPS", "2000"))
+MODE = os.environ.get("TOPK_MODE", "groundtruth")
+TOP_K_VALUES = [int(value) for value in os.environ.get("TOPK_VALUES", "1,2,3,4,5").split(",")]
+SEEDS = [int(value) for value in os.environ.get("TOPK_SEEDS", ",".join(str(i) for i in range(1, 31))).split(",")]
 
 
-def load_and_compute_final_entropy(filepath):
-    df = pd.read_parquet(filepath)
-    
-    all_labels = []
+def compute_final_entropy(filepath: str) -> float:
+    df = pd.read_parquet(filepath, columns=["human_labels"])
+    counts: Counter[str] = Counter()
     for human_labels in df["human_labels"].values:
         if human_labels is not None:
-            all_labels.extend(human_labels)
-    
-    return compute_entropy_at_step(all_labels)
+            counts.update(human_labels)
+    if not counts:
+        return 0.0
+    freq = np.array(list(counts.values()), dtype=float)
+    probs = freq / freq.sum()
+    return float(entropy(probs, base=2))
 
 
-def main():
+def main() -> None:
     print(f"Loading outputs from: {OUTPUT_DIR}")
     print(f"Mode: {MODE}, Steps: {STEPS}\n")
     print(f"Top-k values (exact): {TOP_K_VALUES}")
     print(f"Seeds (exact): {SEEDS}\n")
-    
-    # Group files by top-k value using exact expected filenames only
-    by_topk = {k: {} for k in TOP_K_VALUES}  # top_k -> {seed: entropy}
-    missing_files = []
+
+    os.makedirs(PLOTS_DIR, exist_ok=True)
+
+    missing_files: list[str] = []
+    summary_rows: list[dict[str, float | int]] = []
+    distributions: list[list[float]] = []
+    available_top_ks: list[int] = []
 
     for top_k in TOP_K_VALUES:
+        entropies: list[float] = []
         for seed in SEEDS:
-            fname = f"mid_{MODE}_k{top_k}_{STEPS}_seed{seed}.parquet"
-            filepath = os.path.join(OUTPUT_DIR, fname)
-            if not os.path.exists(filepath):
-                missing_files.append(fname)
+            path = os.path.join(OUTPUT_DIR, f"mid_{MODE}_k{top_k}_{STEPS}_seed{seed}.parquet")
+            if not os.path.exists(path):
+                missing_files.append(os.path.basename(path))
                 continue
-            by_topk[top_k][seed] = load_and_compute_final_entropy(filepath)
-    
-    available_topk = {k: v for k, v in by_topk.items() if v}
-    if not available_topk:
-        raise FileNotFoundError(f"No matching files found for {MODE} with {STEPS} steps")
+            entropies.append(compute_final_entropy(path))
+
+        if not entropies:
+            continue
+
+        arr = np.array(entropies, dtype=float)
+        summary_rows.append({
+            "top_k": top_k,
+            "n_seeds": int(len(arr)),
+            "mean_entropy": float(arr.mean()),
+            "std_entropy": float(arr.std(ddof=1)) if len(arr) > 1 else 0.0,
+            "min_entropy": float(arr.min()),
+            "max_entropy": float(arr.max()),
+        })
+        distributions.append(entropies)
+        available_top_ks.append(top_k)
+
     if missing_files:
         print(f"Warning: missing {len(missing_files)} expected files.")
-        for name in missing_files[:10]:
-            print(f"  - {name}")
+        for filename in missing_files[:10]:
+            print(f"  - {filename}")
         if len(missing_files) > 10:
-            print(f"  ... and {len(missing_files) - 10} more")
+            print("  ...")
         print()
-    
-    print(f"Found {len(available_topk)} top-k configurations with available files:\n")
-    
-    # Compute statistics for each top-k
-    results = []
-    for top_k in sorted(available_topk.keys()):
-        entropies = list(available_topk[top_k].values())
-        seeds = sorted(available_topk[top_k].keys())
-        
-        mean_entropy = np.mean(entropies)
-        std_entropy = np.std(entropies, ddof=1)
-        min_entropy = np.min(entropies)
-        max_entropy = np.max(entropies)
-        
-        # Identify outliers using IQR method (same as boxplot)
-        q1 = np.percentile(entropies, 25)
-        q3 = np.percentile(entropies, 75)
-        iqr = q3 - q1
-        lower_bound = q1 - 1.5 * iqr
-        upper_bound = q3 + 1.5 * iqr
-        
-        outlier_info = []
-        for seed in seeds:
-            ent = by_topk[top_k][seed]
-            if ent < lower_bound or ent > upper_bound:
-                outlier_info.append(f"seed {seed}: {ent:.4f}")
-        
-        print(f"top-k = {top_k}: mean entropy: {mean_entropy:.4f} ± {std_entropy:.4f}")
-        if outlier_info:
-            print(f"  Outliers: {', '.join(outlier_info)}")
-        
-        results.append({
-            'top_k': top_k,
-            'n_seeds': len(seeds),
-            'mean_entropy': mean_entropy,
-            'std_entropy': std_entropy,
-            'min_entropy': min_entropy,
-            'max_entropy': max_entropy,
-            'entropies': entropies,
-            'outliers': outlier_info,
-        })
-    
-    # Sort by top-k value
-    results.sort(key=lambda x: x['top_k'])
-    
-    # Save summary CSV
-    summary_rows = []
-    for r in results:
-        summary_rows.append({
-            'top_k': r['top_k'],
-            'n_seeds': r['n_seeds'],
-            'mean_entropy': f"{r['mean_entropy']:.4f}",
-            'std_entropy': f"{r['std_entropy']:.4f}",
-            'min_entropy': f"{r['min_entropy']:.4f}",
-            'max_entropy': f"{r['max_entropy']:.4f}",
-        })
-    
-    summary_df = pd.DataFrame(summary_rows)
-    csv_path = os.path.join(BASE_DIR, "plots", f"topk_comparison_{MODE}_{STEPS}steps.csv")
-    os.makedirs(os.path.join(BASE_DIR, "plots"), exist_ok=True)
+
+    if not summary_rows:
+        raise FileNotFoundError("No matching top-k simulation outputs found.")
+
+    summary_df = pd.DataFrame(summary_rows).sort_values("top_k").reset_index(drop=True)
+
+    print(f"Found {len(summary_df)} top-k configurations with available files:\n")
+    for row in summary_df.itertuples(index=False):
+        print(
+            f"top-k = {row.top_k}: mean entropy = "
+            f"{row.mean_entropy:.4f} +/- {row.std_entropy:.4f}"
+        )
+
+    output_stem = f"topk_comparison_{MODE}_{STEPS}steps"
+    csv_path = os.path.join(PLOTS_DIR, f"{output_stem}.csv")
     summary_df.to_csv(csv_path, index=False)
-    print(f"Summary saved to: {csv_path}\n")
-    
-    # Create comparison plot
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
-    
-    # Plot 1: Line plot with error bars
-    top_ks = [r['top_k'] for r in results]
-    means = [r['mean_entropy'] for r in results]
-    stds = [r['std_entropy'] for r in results]
-    
-    ax1.errorbar(top_ks, means, yerr=stds, marker='o', capsize=5, linewidth=2, markersize=8)
-    ax1.set_xlabel('Top-k (number of dominant classes)', fontsize=12)
-    ax1.set_ylabel('Final Entropy (bits)', fontsize=12)
-    ax1.set_title(f'Mean Final Entropy by Top-k\n({STEPS} steps, error bars = std)', fontsize=13)
-    ax1.grid(True, alpha=0.3)
-    ax1.set_xticks(top_ks)
-    
-    # Plot 2: Box plots showing distribution
-    entropy_distributions = [r['entropies'] for r in results]
-    labels = [f"k={k}" for k in top_ks]
-    bp = ax2.boxplot(entropy_distributions, labels=labels, patch_artist=True)
-    for patch in bp['boxes']:
-        patch.set_facecolor('lightblue')
-    ax2.set_xlabel('Top-k', fontsize=12)
-    ax2.set_ylabel('Final Entropy (bits)', fontsize=12)
-    ax2.set_title(f'Entropy Distribution by Top-k\n({STEPS} steps, {results[0]["n_seeds"]} seeds)', fontsize=13)
-    ax2.grid(axis='y', alpha=0.3)
-    
+
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5.5))
+
+    axes[0].errorbar(
+        summary_df["top_k"],
+        summary_df["mean_entropy"],
+        yerr=summary_df["std_entropy"],
+        marker="o",
+        linewidth=2,
+        capsize=4,
+        color="#1f5aa6",
+    )
+    axes[0].set_xlabel("Top-k (stevilo dominantnih razredov)")
+    axes[0].set_ylabel("Koncna entropija (biti)")
+    axes[0].set_title(
+        f"Povprecna koncna entropija glede na top-k\n({STEPS} korakov, napake = std)"
+    )
+    axes[0].grid(True, linestyle="--", alpha=0.3)
+
+    bp = axes[1].boxplot(
+        distributions,
+        tick_labels=[f"k={value}" for value in available_top_ks],
+        patch_artist=True,
+    )
+    for box in bp["boxes"]:
+        box.set(facecolor="#9ec7d8", edgecolor="black", linewidth=1.0)
+    for whisker in bp["whiskers"]:
+        whisker.set(color="black", linewidth=1.0)
+    for cap in bp["caps"]:
+        cap.set(color="black", linewidth=1.0)
+    for median in bp["medians"]:
+        median.set(color="#ff7f0e", linewidth=1.0)
+
+    axes[1].set_xlabel("Top-k")
+    axes[1].set_ylabel("Koncna entropija (biti)")
+    axes[1].set_title(
+        f"Porazdelitev entropije glede na top-k\n({STEPS} korakov, {len(SEEDS)} seeds)"
+    )
+    axes[1].grid(True, axis="y", linestyle="--", alpha=0.3)
+
     plt.tight_layout()
-    
-    plot_path = os.path.join(BASE_DIR, "plots", f"topk_comparison_{MODE}_{STEPS}steps.png")
-    plt.savefig(plot_path, dpi=150, bbox_inches='tight')
-    print(f"Plot saved to: {plot_path}")
-    
-    # Print best configuration
-    best = max(results, key=lambda x: x['mean_entropy'])
-    print(f"\nBest top-k: {best['top_k']}")
-    print(f"  Mean entropy: {best['mean_entropy']:.4f} ± {best['std_entropy']:.4f}")
+
+    plot_path = os.path.join(PLOTS_DIR, f"{output_stem}.png")
+    plt.savefig(plot_path, dpi=180, bbox_inches="tight")
+    plt.close()
+
+    best_row = summary_df.loc[summary_df["mean_entropy"].idxmax()]
+    print(f"\nSummary saved to: {csv_path}")
+    print(f"Plot saved to: {plot_path}\n")
+    print(f"Best top-k: {int(best_row['top_k'])}")
+    print(
+        f"  Mean entropy: {best_row['mean_entropy']:.4f} +/- "
+        f"{best_row['std_entropy']:.4f}"
+    )
 
 
 if __name__ == "__main__":

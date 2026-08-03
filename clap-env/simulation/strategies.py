@@ -238,16 +238,255 @@ def run_diverse_mode(df, all_embeddings_norm, steps, seed):
     human_labels = human_labels_by_idx[first_pick]
     count_labels(human_labels, known_labels, class_counts)
 
+    # Incremental max-min:
+    # keep, for every sample, its max similarity to any already-classified sample.
+    # This avoids recomputing a full N x |C| matrix at every step.
+    max_sims = all_embeddings_norm @ all_embeddings_norm[first_pick]
+    max_sims[is_classified] = np.inf
+
     for step in range(2, steps + 1):
-        next_idx = get_next_max_min(all_embeddings_norm, is_classified)
-        if next_idx is None:
-            raise ValueError(f"Diverse returned None at step {step}")
+        if np.all(is_classified):
+            raise ValueError(f"Diverse exhausted dataset at step {step}")
+
+        next_idx = int(np.argmin(max_sims))
 
         is_classified[next_idx] = True
         classified_indices.append(next_idx)
 
         human_labels = human_labels_by_idx[next_idx]
         count_labels(human_labels, known_labels, class_counts)
+
+        # Update max similarity frontier with the newly selected point.
+        new_sims = all_embeddings_norm @ all_embeddings_norm[next_idx]
+        max_sims = np.maximum(max_sims, new_sims)
+        max_sims[is_classified] = np.inf
+
+    return classified_indices, known_labels, class_counts
+
+
+def run_kmeans_mode(df, all_embeddings_norm, steps, seed, n_clusters, sub_strategy="diverse"):
+    from sklearn.cluster import KMeans
+
+    n_samples = len(df)
+    is_classified = np.zeros(n_samples, dtype=bool)
+    known_labels = set()
+    class_counts = {}
+    classified_indices = []
+    human_labels_by_idx = df["human_labels"].values
+
+    # --- Phase 1: K-means clustering ---
+    # Centroids are synthetic vectors — no real data points are pre-classified.
+    # They only serve to initialize the per-cluster similarity frontier.
+    kmeans = KMeans(n_clusters=n_clusters, random_state=seed, n_init="auto")
+    kmeans.fit(all_embeddings_norm)
+    cluster_labels = kmeans.labels_
+    centroids = kmeans.cluster_centers_
+
+    cluster_members = [np.where(cluster_labels == c)[0] for c in range(n_clusters)]
+
+    # Normalize centroids so dot product gives cosine similarity.
+    centroid_norms = np.linalg.norm(centroids, axis=1, keepdims=True)
+    centroids_norm = centroids / (centroid_norms + 1e-12)
+
+    # Per-cluster diverse state: initialize frontier from centroid (not a real point).
+    if sub_strategy == "diverse":
+        cluster_max_sims = []
+        for c in range(n_clusters):
+            members = cluster_members[c]
+            sims = all_embeddings_norm[members] @ centroids_norm[c]
+            cluster_max_sims.append(sims)
+
+    # --- Phase 2: Round-robin across clusters (full step budget, no warm-start cost) ---
+    step_cursor = 0
+    for _ in range(steps):
+        # Find next non-exhausted cluster (round-robin with skip).
+        found = False
+        for _skip in range(n_clusters):
+            c = step_cursor % n_clusters
+            step_cursor += 1
+            members = cluster_members[c]
+            if not np.all(is_classified[members]):
+                found = True
+                break
+        if not found:
+            break
+
+        members = cluster_members[c]
+
+        if sub_strategy == "random":
+            unclassified = members[~is_classified[members]]
+            next_idx = int(np.random.choice(unclassified))
+        elif sub_strategy == "diverse":
+            sims = cluster_max_sims[c]
+            local_idx = int(np.argmin(sims))
+            next_idx = int(members[local_idx])
+
+            new_sims = all_embeddings_norm[members] @ all_embeddings_norm[next_idx]
+            cluster_max_sims[c] = np.maximum(sims, new_sims)
+        else:
+            raise ValueError(f"Unknown sub_strategy: {sub_strategy}")
+
+        is_classified[next_idx] = True
+        classified_indices.append(next_idx)
+        count_labels(human_labels_by_idx[next_idx], known_labels, class_counts)
+
+        if sub_strategy == "diverse":
+            cluster_max_sims[c][is_classified[members]] = np.inf
+
+    return classified_indices, known_labels, class_counts
+
+
+def run_balanced_partition_mode(df, all_embeddings_norm, steps, seed, n_clusters):
+    """Randomly split the dataset into balanced groups, then sample round-robin.
+
+    This is a control baseline for K-means + random: it keeps the same number
+    of groups and the same round-robin sampling schedule, but removes the
+    embedding-space structure from the grouping step.
+    """
+    n_samples = len(df)
+    if n_clusters <= 0:
+        raise ValueError("n_clusters must be positive")
+    if n_clusters > n_samples:
+        raise ValueError("n_clusters cannot exceed the number of samples")
+
+    is_classified = np.zeros(n_samples, dtype=bool)
+    known_labels = set()
+    class_counts = {}
+    classified_indices = []
+    human_labels_by_idx = df["human_labels"].values
+
+    rng = np.random.default_rng(seed)
+    shuffled_indices = rng.permutation(n_samples)
+    cluster_members = [group.astype(int) for group in np.array_split(shuffled_indices, n_clusters)]
+
+    step_cursor = 0
+    for _ in range(steps):
+        found = False
+        for _skip in range(n_clusters):
+            c = step_cursor % n_clusters
+            step_cursor += 1
+            members = cluster_members[c]
+            if len(members) > 0 and not np.all(is_classified[members]):
+                found = True
+                break
+        if not found:
+            break
+
+        members = cluster_members[c]
+        unclassified = members[~is_classified[members]]
+        next_idx = int(rng.choice(unclassified))
+
+        is_classified[next_idx] = True
+        classified_indices.append(next_idx)
+        count_labels(human_labels_by_idx[next_idx], known_labels, class_counts)
+
+    return classified_indices, known_labels, class_counts
+
+
+def run_hdbscan_mode(df, all_embeddings_norm, steps, seed,
+                     min_cluster_size=None, min_samples=1, umap_dim=20,
+                     cluster_order="smallest_first", noise_every_cluster_picks=None):
+    import hdbscan
+    from umap import UMAP
+
+    n_samples = len(df)
+    is_classified = np.zeros(n_samples, dtype=bool)
+    known_labels = set()
+    class_counts = {}
+    classified_indices = []
+    human_labels_by_idx = df["human_labels"].values
+
+    if min_cluster_size is None:
+        min_cluster_size = max(5, n_samples // 50)
+
+    reducer = UMAP(n_components=umap_dim, metric="cosine", random_state=seed)
+    emb_reduced = reducer.fit_transform(all_embeddings_norm)
+
+    clusterer = hdbscan.HDBSCAN(
+        min_cluster_size=min_cluster_size,
+        min_samples=min_samples,
+        metric="euclidean",
+        core_dist_n_jobs=1,
+    )
+    cluster_labels = clusterer.fit_predict(emb_reduced)
+
+    real_ids = sorted(set(cluster_labels) - {-1})
+    cluster_members = []
+    for lbl in real_ids:
+        members = np.where(cluster_labels == lbl)[0]
+        cluster_members.append(members)
+
+    if cluster_order == "smallest_first":
+        cluster_members.sort(key=len)
+    elif cluster_order == "largest_first":
+        cluster_members.sort(key=len, reverse=True)
+    else:
+        raise ValueError(f"Unknown cluster_order: {cluster_order}")
+    n_clusters = len(cluster_members)
+
+    noise_indices = np.where(cluster_labels == -1)[0]
+    noise_count = len(noise_indices)
+
+    if n_clusters == 0 and noise_count == 0:
+        raise ValueError("HDBSCAN produced no clusters and no noise")
+
+    sizes = [len(m) for m in cluster_members]
+    print(
+        f"  HDBSCAN (UMAP-{umap_dim}d): {n_clusters} clusters, "
+        f"noise={noise_count} ({100*noise_count/n_samples:.1f}%)"
+    )
+    if sizes:
+        print(
+            f"  Cluster sizes: min={min(sizes)} max={max(sizes)} "
+            f"median={sorted(sizes)[len(sizes) // 2]}"
+        )
+
+    # --- Phase 1: one random pick per cluster in chosen order ---
+    phase1_picks = 0
+    phase1_noise_picks = 0
+    for c in range(n_clusters):
+        if len(classified_indices) >= steps:
+            break
+        members = cluster_members[c]
+        unclassified = members[~is_classified[members]]
+        if len(unclassified) == 0:
+            continue
+        next_idx = int(np.random.choice(unclassified))
+        is_classified[next_idx] = True
+        classified_indices.append(next_idx)
+        count_labels(human_labels_by_idx[next_idx], known_labels, class_counts)
+        phase1_picks += 1
+
+        # Optional noise check cadence during phase 1.
+        if (
+            noise_every_cluster_picks is not None
+            and noise_every_cluster_picks > 0
+            and phase1_picks % noise_every_cluster_picks == 0
+            and len(classified_indices) < steps
+        ):
+            noise_unclassified = noise_indices[~is_classified[noise_indices]]
+            if len(noise_unclassified) > 0:
+                noise_idx = int(np.random.choice(noise_unclassified))
+                is_classified[noise_idx] = True
+                classified_indices.append(noise_idx)
+                count_labels(human_labels_by_idx[noise_idx], known_labels, class_counts)
+                phase1_noise_picks += 1
+
+    print(
+        f"  Phase 1: {phase1_picks} cluster picks + {phase1_noise_picks} noise picks "
+        f"across {n_clusters} clusters"
+    )
+
+    # --- Phase 2: random from all unclassified (clusters + noise) ---
+    all_indices = np.arange(n_samples)
+    while len(classified_indices) < steps:
+        unclassified = all_indices[~is_classified]
+        if len(unclassified) == 0:
+            break
+        next_idx = int(np.random.choice(unclassified))
+        is_classified[next_idx] = True
+        classified_indices.append(next_idx)
+        count_labels(human_labels_by_idx[next_idx], known_labels, class_counts)
 
     return classified_indices, known_labels, class_counts
 
@@ -263,6 +502,7 @@ def run_groundtruth_mode(
     initial_classified_indices=None,
     initial_known_labels=None,
     initial_class_counts=None,
+    enable_bayesian_drop: bool = True,
 ):
     """
     Groundtruth-guided selection over the actual label space
@@ -376,7 +616,7 @@ def run_groundtruth_mode(
         hits = hits_per_class.get(target_class, 0)
 
         # Decide whether to drop this label using Bayesian rule
-        if should_drop_label_bayesian(
+        if enable_bayesian_drop and should_drop_label_bayesian(
             hits=hits,
             attempts=attempts,
             min_useful_hit_rate=GROUNDTRUTH_MIN_USEFUL_HIT_RATE,

@@ -4,7 +4,7 @@ import numpy as np, pandas as pd, matplotlib.pyplot as plt
 from scipy.stats import entropy
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-OUTPUT_DIR = os.path.join(BASE_DIR, "outputs")
+OUTPUT_DIR = os.path.join(BASE_DIR, "simulation_outputs")
 PLOTS_DIR = os.path.join(BASE_DIR, "plots")
 STEPS, MODE = 2000, "groundtruth"
 PATTERN = re.compile(rf"^mid_{MODE}_(n\w+)_(d\w+)_{STEPS}_seed(\d+)\.parquet$")

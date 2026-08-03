@@ -9,7 +9,7 @@ from scipy.stats import entropy as scipy_entropy
 
 
 SCRIPT_DIR = Path(__file__).parent
-OUTPUTS_DIR = SCRIPT_DIR / "outputs"
+OUTPUTS_DIR = SCRIPT_DIR / "simulation_outputs"
 RESULTS_DIR = SCRIPT_DIR / "distribution_results"
 PLOTS_DIR = SCRIPT_DIR / "plots"
 
@@ -32,14 +32,14 @@ STRATEGIES = [
         "diverse",
     ),
     (
-        "mid_groundtruth_k0_*_seed*.parquet",
-        re.compile(r"^mid_groundtruth_k0_(\d+)_seed(\d+)\.parquet$"),
-        "groundtruth_k0",
+        "mid_groundtruth_cold_k0_nb_*_seed*.parquet",
+        re.compile(r"^mid_groundtruth_cold_k0_nb_(\d+)_seed(\d+)\.parquet$"),
+        "groundtruth_cold_k0_nb",
     ),
     (
-        "mid_groundtruth_k2_*_seed*.parquet",
-        re.compile(r"^mid_groundtruth_k2_(\d+)_seed(\d+)\.parquet$"),
-        "groundtruth_k2",
+        "mid_groundtruth_cold_k0_*_seed*.parquet",
+        re.compile(r"^mid_groundtruth_cold_k0_(\d+)_seed(\d+)\.parquet$"),
+        "groundtruth_cold_k0",
     ),
     (
         "mid_groundtruth_cold_k2_*_seed*.parquet",

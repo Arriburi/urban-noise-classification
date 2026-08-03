@@ -7,7 +7,7 @@ import pandas as pd
 
 
 BASE_DIR = os.path.dirname(__file__)
-OUTPUT_DIR = os.path.join(BASE_DIR, "outputs")
+OUTPUT_DIR = os.path.join(BASE_DIR, "simulation_outputs")
 BASE_PARQUET = os.path.join(BASE_DIR, "audioset_eval_mid.parquet")
 
 def parse_diverse_filename(name: str) -> Tuple[int, int] | None:
